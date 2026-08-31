@@ -6,6 +6,7 @@
  */
 
 #pragma once
+#include <cfenv>
 
 #ifdef __cplusplus
 extern "C" {

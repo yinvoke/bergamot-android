@@ -51,6 +51,7 @@ if(SSPLIT_USE_INTERNAL_PCRE2)
     -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE} # Necessary for proper MacOS compilation
     -DCMAKE_CROSSCOMPILING_EMULATOR=${CMAKE_CROSSCOMPILING_EMULATOR_WITH_SEMICOLON} # Necessary for proper MacOS compilation
     -DCMAKE_POSITION_INDEPENDENT_CODE:BOOL=true # Added for pybind11
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 # pcre2 10.39 declares cmake_minimum_required <3.5, rejected by cmake 4
     )
 
   # Android platform needs to be explicitly passed given this is an external project.

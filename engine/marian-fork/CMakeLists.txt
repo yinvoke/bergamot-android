@@ -84,7 +84,7 @@ if(${CMAKE_TARGET_ARCHITECTURE_CODE} MATCHES "arm")
   add_compile_definitions(ARM)
   #
 else()
-  set(USE_INTGEMM ON)
+  message(FATAL_ERROR "bergamot-android is ARM-only: the x86 intgemm backend is not vendored. Build on an ARM host (Apple Silicon / ARM Linux) or for an ARM target.")
 endif()
 
 if(USE_INTGEMM)

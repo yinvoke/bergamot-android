@@ -182,14 +182,17 @@ if(COMPILE_TESTS)
     enable_testing()
 endif(COMPILE_TESTS)
 
+# On ARM the marian-fork CMakeLists adds ARM/FMA/SSE + the matching options as
+# *directory-scoped* definitions, but marian-fork is added after src/ below, so
+# the bergamot layer (src/translator) never sees them and its includes of
+# marian headers hit raw x86 intrinsics. Define them globally here instead.
+if(NOT COMPILE_WASM AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|armv8)")
+  add_compile_definitions(ARM FMA SSE)
+  add_compile_options(-flax-vector-conversions -fno-strict-aliasing)
+endif()
+
 add_subdirectory(3rd_party)
 add_subdirectory(src)
-
-if(COMPILE_WASM)
-  add_subdirectory(wasm)
-else()
-  add_subdirectory(src/app)
-endif(COMPILE_WASM)
 
 option(COMPILE_PYTHON "Compile python bindings. Intended to be activated with setup.py" OFF)
 if(COMPILE_PYTHON)
