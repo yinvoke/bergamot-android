@@ -54,10 +54,10 @@ data class ModelFiles(
 }
 
 class EngineConfig(
-    /** Worker threads inside the engine. 0 = run in the calling thread. */
-    val threads: Int = 0,
-    /** Translation cache entries; 0 disables caching. */
-    val cacheSize: Int = 0,
+    /** Worker translation threads inside the engine (>=1). */
+    val threads: Int = 1,
+    
+    
     /** Unload a model after this long without use. */
     val idleUnloadMillis: Long = 60_000,
 )
@@ -136,7 +136,7 @@ class BergamotEngine(private val config: EngineConfig = EngineConfig()) : Closea
     // ---- All below runs on the engine thread. ----
 
     private fun serviceHandle(): Long {
-        if (service == 0L) service = NativeBridge.createService(config.cacheSize)
+        if (service == 0L) service = NativeBridge.createService(config.threads)
         return service
     }
 
@@ -145,7 +145,7 @@ class BergamotEngine(private val config: EngineConfig = EngineConfig()) : Closea
     private fun acquire(model: ModelFiles): Long {
         serviceHandle()
         val loaded = models.getOrPut(keyOf(model)) {
-            LoadedModel(NativeBridge.loadModel(model.toConfigYaml()), System.nanoTime())
+            LoadedModel(NativeBridge.loadModel(serviceHandle(), model.toConfigYaml()), System.nanoTime())
         }
         loaded.lastUsedAt = System.nanoTime()
         return loaded.handle

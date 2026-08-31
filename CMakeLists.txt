@@ -22,6 +22,16 @@ endif()
 add_compile_definitions(ARM FMA SSE COMPILE_CPU=1 USE_PTHREADS USE_SENTENCEPIECE _USE_INTERNAL_STRING_VIEW)
 add_compile_options(-flax-vector-conversions -fno-strict-aliasing)
 
+if(ANDROID)
+  # bionic ships pthreads inside libc; the ancient FindThreads invocations in
+  # vendored subprojects (ruy/cpuinfo) fail to detect that. Pre-seed the result.
+  set(CMAKE_THREAD_LIBS_INIT "")
+  set(CMAKE_HAVE_THREADS_LIBRARY 1)
+  set(CMAKE_USE_PTHREADS_INIT 1)
+  set(THREADS_PREFER_PTHREAD_FLAG OFF)
+  set(Threads_FOUND TRUE)
+endif()
+
 add_subdirectory(engine)
 
 if(ANDROID)

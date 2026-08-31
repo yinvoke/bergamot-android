@@ -9,9 +9,9 @@ internal object NativeBridge {
         System.loadLibrary("bergamot")
     }
 
-    external fun createService(cacheSize: Int): Long
+    external fun createService(workers: Int): Long
     external fun destroyService(service: Long)
-    external fun loadModel(configYaml: String): Long
+    external fun loadModel(service: Long, configYaml: String): Long
     external fun destroyModel(model: Long)
     external fun translate(service: Long, model: Long, texts: Array<String>, html: Boolean): Array<String>
     external fun translatePivot(

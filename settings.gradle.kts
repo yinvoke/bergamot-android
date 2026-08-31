@@ -13,3 +13,4 @@ dependencyResolutionManagement {
 }
 rootProject.name = "bergamot-android"
 include(":bergamot")
+include(":sample")
