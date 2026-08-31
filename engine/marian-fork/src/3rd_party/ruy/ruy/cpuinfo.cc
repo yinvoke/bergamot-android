@@ -1,4 +1,11 @@
 #include "ruy/cpuinfo.h"
+#if defined(__aarch64__) && defined(__linux__)
+#include <sys/auxv.h>
+#include <asm/hwcap.h>
+#endif
+#if defined(__aarch64__) && defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -13,6 +20,25 @@
 #endif
 
 namespace ruy {
+
+namespace {
+// The vendored cpuinfo (2020) predates Apple Silicon and cannot read the
+// sysfs cpu topology from an Android app sandbox, so it reports "no dotprod"
+// on hardware that has it -- silently pinning ruy to the slow kNeon kernels.
+// Ask the kernel directly as a fallback.
+bool OsReportsDotprod() {
+#if defined(__aarch64__) && defined(__linux__)
+  return (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
+#elif defined(__aarch64__) && defined(__APPLE__)
+  int value = 0;
+  size_t size = sizeof(value);
+  if (sysctlbyname("hw.optional.arm.FEAT_DotProd", &value, &size, nullptr, 0) == 0) return value != 0;
+  return false;
+#else
+  return false;
+#endif
+}
+}  // namespace
 
 namespace {
 void MakeDummyCacheParams(CpuCacheParams* result) {
@@ -94,7 +120,8 @@ CpuInfo::InitStatus CpuInfo::Initialize() {
 }
 
 bool CpuInfo::NeonDotprod() {
-  return EnsureInitialized() && cpuinfo_has_arm_neon_dot();
+  if (EnsureInitialized() && cpuinfo_has_arm_neon_dot()) return true;
+  return OsReportsDotprod();
 }
 
 bool CpuInfo::Sse42() {
@@ -155,7 +182,7 @@ bool CpuInfo::EnsureInitialized() {
   RUY_DCHECK_EQ(init_status_, InitStatus::kInitialized);
   return true;
 }
-bool CpuInfo::NeonDotprod() { return false; }
+bool CpuInfo::NeonDotprod() { return OsReportsDotprod(); }
 bool CpuInfo::Sse42() { return false; }
 bool CpuInfo::Avx() { return false; }
 bool CpuInfo::Avx2Fma() { return false; }

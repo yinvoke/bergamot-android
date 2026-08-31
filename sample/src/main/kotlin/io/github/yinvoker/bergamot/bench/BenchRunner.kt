@@ -25,6 +25,7 @@ import org.json.JSONObject
 class BenchRunner(
     private val context: Context,
     private val bergamotThreads: Int,
+    private val workspaceMb: Int,
     private val log: (String) -> Unit,
 ) {
 
@@ -47,7 +48,17 @@ class BenchRunner(
             .put("sdk", Build.VERSION.SDK_INT)
     }
 
+    /** Idle baseline (app + UI, no engine): what phase metrics subtract. */
+    private fun sampleBaseline(): JSONObject {
+        val pss = ArrayList<Long>()
+        repeat(6) { pss.add(android.os.Debug.getPss()); Thread.sleep(250) }
+        return JSONObject()
+            .put("pssMb", Math.round(pss.average() / 1024.0 * 10) / 10.0)
+            .put("pssMinMb", Math.round(pss.min() / 1024.0 * 10) / 10.0)
+    }
+
     suspend fun run(): File {
+        val baseline = sampleBaseline()
         val eng = asset("eng.txt")
         val jpn = asset("jpn.txt")
         val phases = JSONArray()
@@ -77,7 +88,7 @@ class BenchRunner(
             // One engine per process run: marian keeps process-global state and a
             // second AsyncService in the same process fails (known engine limit).
             val t = bergamotThreads
-            val engine = BergamotEngine(EngineConfig(threads = t, idleUnloadMillis = Long.MAX_VALUE / 2))
+            val engine = BergamotEngine(EngineConfig(threads = t, workspaceMb = workspaceMb, idleUnloadMillis = Long.MAX_VALUE / 2))
             try {
                 phases.put(bergamotPhase("bergamot-enzh-${t}t", engine) {
                     it.translate(eng, ModelFiles.fromDirectory(enzh))
@@ -99,11 +110,13 @@ class BenchRunner(
         }
 
         val result = JSONObject()
+            .put("baseline", baseline)
             .put("timestamp", System.currentTimeMillis())
             .put("device", deviceInfo())
             .put("n", eng.size)
             .put("phases", phases)
-        val out = File(filesDir, "bench_result_${bergamotThreads}t.json")
+        val suffix = if (workspaceMb == 128) "" else "-w$workspaceMb"
+        val out = File(filesDir, "bench_result_${bergamotThreads}t$suffix.json")
         out.writeText(result.toString())
         // Mirror into internal storage: on Android 14+ neither shell nor run-as
         // can read the external app dir, so this copy is what adb collects.

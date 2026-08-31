@@ -2,7 +2,11 @@
 // Thin by design: batch in, batch out, blocking from the caller's view.
 // AsyncService workers give intra-batch parallelism; the Kotlin layer owns
 // threading policy, lifecycle and cancellation.
+#include <android/log.h>
 #include <jni.h>
+
+#include "ruy/context.h"
+#include "ruy/cpuinfo.h"
 
 #include <condition_variable>
 #include <memory>
@@ -87,6 +91,14 @@ extern "C" {
 JNIEXPORT jlong JNICALL
 Java_io_github_yinvoker_bergamot_NativeBridge_createService(JNIEnv *env, jobject, jint workers) {
   try {
+    {
+      ruy::Context probe;
+      ruy::CpuInfo cpuInfo;
+      __android_log_print(ANDROID_LOG_INFO, "bergamot",
+                          "ruy runtime paths=0x%x dotprod=%d",
+                          static_cast<int>(probe.get_runtime_enabled_paths()),
+                          cpuInfo.NeonDotprod() ? 1 : 0);
+    }
     AsyncService::Config config;
     config.numWorkers = workers < 1 ? 1 : static_cast<size_t>(workers);
     return reinterpret_cast<jlong>(new AsyncService(config));

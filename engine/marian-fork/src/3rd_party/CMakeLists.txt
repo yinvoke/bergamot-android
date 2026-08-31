@@ -24,6 +24,16 @@ if(USE_RUY)
   set(CPUINFO_BUILD_TOOLS      OFF CACHE BOOL " " FORCE)
   add_subdirectory(ruy/third_party/cpuinfo EXCLUDE_FROM_ALL)
   add_subdirectory(ruy EXCLUDE_FROM_ALL)
+  # Upstream Bazel builds ruy's arm kernel/pack files with 8.2+dotprod so the
+  # SDOT kernels exist behind runtime dispatch; the bazel_to_cmake conversion
+  # dropped those per-target copts, silently compiling the fast int8 path OUT.
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    foreach(ruy_arm_target ruy_kernel_arm ruy_pack_arm)
+      if(TARGET ${ruy_arm_target})
+        target_compile_options(${ruy_arm_target} PRIVATE -march=armv8.2-a+dotprod)
+      endif()
+    endforeach()
+  endif()
 endif(USE_RUY)
 
 if(USE_ONNX_SGEMM)

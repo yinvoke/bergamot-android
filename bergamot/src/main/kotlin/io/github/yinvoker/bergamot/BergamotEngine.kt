@@ -28,7 +28,7 @@ data class ModelFiles(
         }
     }
 
-    internal fun toConfigYaml(): String = """
+    internal fun toConfigYaml(workspaceMb: Int): String = """
         models:
           - ${model.absolutePath}
         vocabs:
@@ -42,7 +42,7 @@ data class ModelFiles(
         word-penalty: 0
         max-length-break: 128
         mini-batch-words: 1024
-        workspace: 128
+        workspace: $workspaceMb
         max-length-factor: 2.0
         skip-cost: true
         cpu-threads: 0
@@ -56,6 +56,8 @@ data class ModelFiles(
 class EngineConfig(
     /** Worker translation threads inside the engine (>=1). */
     val threads: Int = 1,
+    /** Marian workspace per worker, MB. Smaller = less RAM, may cost speed. */
+    val workspaceMb: Int = 128,
     
     
     /** Unload a model after this long without use. */
@@ -145,7 +147,7 @@ class BergamotEngine(private val config: EngineConfig = EngineConfig()) : Closea
     private fun acquire(model: ModelFiles): Long {
         serviceHandle()
         val loaded = models.getOrPut(keyOf(model)) {
-            LoadedModel(NativeBridge.loadModel(serviceHandle(), model.toConfigYaml()), System.nanoTime())
+            LoadedModel(NativeBridge.loadModel(serviceHandle(), model.toConfigYaml(config.workspaceMb)), System.nanoTime())
         }
         loaded.lastUsedAt = System.nanoTime()
         return loaded.handle

@@ -48,7 +48,7 @@ class MainActivity : Activity() {
             scope.launch {
                 try {
                     withContext(Dispatchers.Default) {
-                        BenchRunner(this@MainActivity, intent.getIntExtra("threads", 1)) { line -> scope.launch { log(line) } }.run()
+                        BenchRunner(this@MainActivity, intent.getIntExtra("threads", 1), intent.getIntExtra("workspace", 128)) { line -> scope.launch { log(line) } }.run()
                     }
                     log("ALL DONE")
                 } catch (e: Exception) {
