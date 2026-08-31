@@ -200,6 +200,19 @@ registry.json  Mozilla 模型下载索引(每个方向的 URL / sha256 / 大小)
 
 ## 🚀 快速开始
 
+### 引入 AAR
+
+从 [Releases](https://github.com/yinvoke/bergamot-android/releases)
+下载 AAR,放进 app 模块的 `libs/` 目录:
+
+```kotlin
+dependencies {
+    implementation(files("libs/bergamot-v0.1.0.aar"))
+    // 本地 AAR 不携带传递依赖,须自行声明:
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+}
+```
+
 ### 获取模型
 
 模型是 Mozilla 为 Firefox 发布的官方翻译模型(MPL-2.0),经
