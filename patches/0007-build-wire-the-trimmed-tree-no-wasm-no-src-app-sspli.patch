@@ -1,0 +1,29 @@
+From 870360a14333431de39d5f45ff602aaaa8f21641 Mon Sep 17 00:00:00 2001
+From: yinvoker <yinvoker@outlook.com>
+Date: Mon, 31 Aug 2026 20:20:51 +0800
+Subject: [PATCH] build: wire the trimmed tree (no wasm/, no src/app, ssplit
+ library-only)
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ engine/3rd_party/ssplit-cpp/src/CMakeLists.txt | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+ create mode 100644 engine/3rd_party/ssplit-cpp/src/CMakeLists.txt
+
+diff --git a/engine/3rd_party/ssplit-cpp/src/CMakeLists.txt b/engine/3rd_party/ssplit-cpp/src/CMakeLists.txt
+new file mode 100644
+index 0000000..1fb529a
+--- /dev/null
++++ b/engine/3rd_party/ssplit-cpp/src/CMakeLists.txt
+@@ -0,0 +1,8 @@
++# bergamot-android: library-only. Upstream's CLI (src/command/) is not vendored.
++include_directories(ssplit)
++add_library(ssplit STATIC ssplit/ssplit.cpp ssplit/regex.cpp)
++target_link_libraries(ssplit ${EXT_LIBS})
++
++set_target_properties(ssplit PROPERTIES
++  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
++  ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+-- 
+2.54.0
+

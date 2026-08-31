@@ -1,0 +1,85 @@
+From 921d6f4a10894b5d13fef62fe461f44e3147bf18 Mon Sep 17 00:00:00 2001
+From: yinvoker <yinvoker@outlook.com>
+Date: Mon, 31 Aug 2026 22:45:52 +0800
+Subject: [PATCH] perf: OS-level dotprod detection fallback (2.1x on host,
+ engine-wide)
+
+The vendored 2020 cpuinfo predates Apple Silicon and cannot read sysfs cpu
+topology from an Android app sandbox, so CpuInfo::NeonDotprod() returned
+false on hardware that has dotprod and ruy silently pinned int8 GEMM (85%
+of translation time per profile) to the generic NEON kernels -- on every
+platform, including the desktop numbers everyone quotes. Fall back to
+getauxval(HWCAP_ASIMDDP) / sysctl FEAT_DotProd when cpuinfo says no.
+
+Host M3, 150 sentences: en-zh 2.42s -> 1.14s, ja-zh pivot 5.18s -> 2.36s,
+byte-identical output (SDOT is exact int8 arithmetic).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../src/3rd_party/ruy/ruy/cpuinfo.cc          | 31 +++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/engine/marian-fork/src/3rd_party/ruy/ruy/cpuinfo.cc b/engine/marian-fork/src/3rd_party/ruy/ruy/cpuinfo.cc
+index a3e75d7..9f49bb0 100644
+--- a/engine/marian-fork/src/3rd_party/ruy/ruy/cpuinfo.cc
++++ b/engine/marian-fork/src/3rd_party/ruy/ruy/cpuinfo.cc
+@@ -1,4 +1,11 @@
+ #include "ruy/cpuinfo.h"
++#if defined(__aarch64__) && defined(__linux__)
++#include <sys/auxv.h>
++#include <asm/hwcap.h>
++#endif
++#if defined(__aarch64__) && defined(__APPLE__)
++#include <sys/sysctl.h>
++#endif
+ 
+ #include <algorithm>
+ #include <cstdint>
+@@ -14,6 +21,25 @@
+ 
+ namespace ruy {
+ 
++namespace {
++// The vendored cpuinfo (2020) predates Apple Silicon and cannot read the
++// sysfs cpu topology from an Android app sandbox, so it reports "no dotprod"
++// on hardware that has it -- silently pinning ruy to the slow kNeon kernels.
++// Ask the kernel directly as a fallback.
++bool OsReportsDotprod() {
++#if defined(__aarch64__) && defined(__linux__)
++  return (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
++#elif defined(__aarch64__) && defined(__APPLE__)
++  int value = 0;
++  size_t size = sizeof(value);
++  if (sysctlbyname("hw.optional.arm.FEAT_DotProd", &value, &size, nullptr, 0) == 0) return value != 0;
++  return false;
++#else
++  return false;
++#endif
++}
++}  // namespace
++
+ namespace {
+ void MakeDummyCacheParams(CpuCacheParams* result) {
+   // Reasonable dummy values
+@@ -94,7 +120,8 @@ CpuInfo::InitStatus CpuInfo::Initialize() {
+ }
+ 
+ bool CpuInfo::NeonDotprod() {
+-  return EnsureInitialized() && cpuinfo_has_arm_neon_dot();
++  if (EnsureInitialized() && cpuinfo_has_arm_neon_dot()) return true;
++  return OsReportsDotprod();
+ }
+ 
+ bool CpuInfo::Sse42() {
+@@ -155,7 +182,7 @@ bool CpuInfo::EnsureInitialized() {
+   RUY_DCHECK_EQ(init_status_, InitStatus::kInitialized);
+   return true;
+ }
+-bool CpuInfo::NeonDotprod() { return false; }
++bool CpuInfo::NeonDotprod() { return OsReportsDotprod(); }
+ bool CpuInfo::Sse42() { return false; }
+ bool CpuInfo::Avx() { return false; }
+ bool CpuInfo::Avx2Fma() { return false; }
+-- 
+2.54.0
+

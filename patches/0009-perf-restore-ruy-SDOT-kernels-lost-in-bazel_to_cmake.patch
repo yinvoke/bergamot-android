@@ -1,0 +1,153 @@
+From 801f9bf3b4ff7a6b9fe7325afe20ec605ab6f115 Mon Sep 17 00:00:00 2001
+From: yinvoker <yinvoker@outlook.com>
+Date: Mon, 31 Aug 2026 22:30:18 +0800
+Subject: [PATCH] perf: restore ruy SDOT kernels lost in bazel_to_cmake
+ conversion
+
+Upstream Bazel compiles ruy's arm kernel/pack files with
+-march=armv8.2-a+dotprod so the int8 dotprod kernels exist behind runtime
+dispatch. The CMake conversion dropped those per-target copts, so
+__ARM_FEATURE_DOTPROD was never defined and every Kernel8bitNeonDotprod*
+symbol was preprocessed out -- int8 GEMM silently ran on the generic NEON
+path on all ARM devices. Also: EngineConfig.workspaceMb, bench baseline
+sampling, 2-thread round support.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../github/yinvoker/bergamot/BergamotEngine.kt  |  8 +++++---
+ engine/marian-fork/src/3rd_party/CMakeLists.txt | 10 ++++++++++
+ .../yinvoker/bergamot/bench/BenchRunner.kt      | 17 +++++++++++++++--
+ .../yinvoker/bergamot/bench/MainActivity.kt     |  2 +-
+ 4 files changed, 31 insertions(+), 6 deletions(-)
+
+diff --git a/bergamot/src/main/kotlin/io/github/yinvoker/bergamot/BergamotEngine.kt b/bergamot/src/main/kotlin/io/github/yinvoker/bergamot/BergamotEngine.kt
+index c954b83..dab196b 100644
+--- a/bergamot/src/main/kotlin/io/github/yinvoker/bergamot/BergamotEngine.kt
++++ b/bergamot/src/main/kotlin/io/github/yinvoker/bergamot/BergamotEngine.kt
+@@ -28,7 +28,7 @@ data class ModelFiles(
+         }
+     }
+ 
+-    internal fun toConfigYaml(): String = """
++    internal fun toConfigYaml(workspaceMb: Int): String = """
+         models:
+           - ${model.absolutePath}
+         vocabs:
+@@ -42,7 +42,7 @@ data class ModelFiles(
+         word-penalty: 0
+         max-length-break: 128
+         mini-batch-words: 1024
+-        workspace: 128
++        workspace: $workspaceMb
+         max-length-factor: 2.0
+         skip-cost: true
+         cpu-threads: 0
+@@ -56,6 +56,8 @@ data class ModelFiles(
+ class EngineConfig(
+     /** Worker translation threads inside the engine (>=1). */
+     val threads: Int = 1,
++    /** Marian workspace per worker, MB. Smaller = less RAM, may cost speed. */
++    val workspaceMb: Int = 128,
+     
+     
+     /** Unload a model after this long without use. */
+@@ -145,7 +147,7 @@ class BergamotEngine(private val config: EngineConfig = EngineConfig()) : Closea
+     private fun acquire(model: ModelFiles): Long {
+         serviceHandle()
+         val loaded = models.getOrPut(keyOf(model)) {
+-            LoadedModel(NativeBridge.loadModel(serviceHandle(), model.toConfigYaml()), System.nanoTime())
++            LoadedModel(NativeBridge.loadModel(serviceHandle(), model.toConfigYaml(config.workspaceMb)), System.nanoTime())
+         }
+         loaded.lastUsedAt = System.nanoTime()
+         return loaded.handle
+diff --git a/engine/marian-fork/src/3rd_party/CMakeLists.txt b/engine/marian-fork/src/3rd_party/CMakeLists.txt
+index aca63ef..566de41 100644
+--- a/engine/marian-fork/src/3rd_party/CMakeLists.txt
++++ b/engine/marian-fork/src/3rd_party/CMakeLists.txt
+@@ -24,6 +24,16 @@ if(USE_RUY)
+   set(CPUINFO_BUILD_TOOLS      OFF CACHE BOOL " " FORCE)
+   add_subdirectory(ruy/third_party/cpuinfo EXCLUDE_FROM_ALL)
+   add_subdirectory(ruy EXCLUDE_FROM_ALL)
++  # Upstream Bazel builds ruy's arm kernel/pack files with 8.2+dotprod so the
++  # SDOT kernels exist behind runtime dispatch; the bazel_to_cmake conversion
++  # dropped those per-target copts, silently compiling the fast int8 path OUT.
++  if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
++    foreach(ruy_arm_target ruy_kernel_arm ruy_pack_arm)
++      if(TARGET ${ruy_arm_target})
++        target_compile_options(${ruy_arm_target} PRIVATE -march=armv8.2-a+dotprod)
++      endif()
++    endforeach()
++  endif()
+ endif(USE_RUY)
+ 
+ if(USE_ONNX_SGEMM)
+diff --git a/sample/src/main/kotlin/io/github/yinvoker/bergamot/bench/BenchRunner.kt b/sample/src/main/kotlin/io/github/yinvoker/bergamot/bench/BenchRunner.kt
+index 597b4b3..47c403a 100644
+--- a/sample/src/main/kotlin/io/github/yinvoker/bergamot/bench/BenchRunner.kt
++++ b/sample/src/main/kotlin/io/github/yinvoker/bergamot/bench/BenchRunner.kt
+@@ -25,6 +25,7 @@ import org.json.JSONObject
+ class BenchRunner(
+     private val context: Context,
+     private val bergamotThreads: Int,
++    private val workspaceMb: Int,
+     private val log: (String) -> Unit,
+ ) {
+ 
+@@ -47,7 +48,17 @@ class BenchRunner(
+             .put("sdk", Build.VERSION.SDK_INT)
+     }
+ 
++    /** Idle baseline (app + UI, no engine): what phase metrics subtract. */
++    private fun sampleBaseline(): JSONObject {
++        val pss = ArrayList<Long>()
++        repeat(6) { pss.add(android.os.Debug.getPss()); Thread.sleep(250) }
++        return JSONObject()
++            .put("pssMb", Math.round(pss.average() / 1024.0 * 10) / 10.0)
++            .put("pssMinMb", Math.round(pss.min() / 1024.0 * 10) / 10.0)
++    }
++
+     suspend fun run(): File {
++        val baseline = sampleBaseline()
+         val eng = asset("eng.txt")
+         val jpn = asset("jpn.txt")
+         val phases = JSONArray()
+@@ -77,7 +88,7 @@ class BenchRunner(
+             // One engine per process run: marian keeps process-global state and a
+             // second AsyncService in the same process fails (known engine limit).
+             val t = bergamotThreads
+-            val engine = BergamotEngine(EngineConfig(threads = t, idleUnloadMillis = Long.MAX_VALUE / 2))
++            val engine = BergamotEngine(EngineConfig(threads = t, workspaceMb = workspaceMb, idleUnloadMillis = Long.MAX_VALUE / 2))
+             try {
+                 phases.put(bergamotPhase("bergamot-enzh-${t}t", engine) {
+                     it.translate(eng, ModelFiles.fromDirectory(enzh))
+@@ -99,11 +110,13 @@ class BenchRunner(
+         }
+ 
+         val result = JSONObject()
++            .put("baseline", baseline)
+             .put("timestamp", System.currentTimeMillis())
+             .put("device", deviceInfo())
+             .put("n", eng.size)
+             .put("phases", phases)
+-        val out = File(filesDir, "bench_result_${bergamotThreads}t.json")
++        val suffix = if (workspaceMb == 128) "" else "-w$workspaceMb"
++        val out = File(filesDir, "bench_result_${bergamotThreads}t$suffix.json")
+         out.writeText(result.toString())
+         // Mirror into internal storage: on Android 14+ neither shell nor run-as
+         // can read the external app dir, so this copy is what adb collects.
+diff --git a/sample/src/main/kotlin/io/github/yinvoker/bergamot/bench/MainActivity.kt b/sample/src/main/kotlin/io/github/yinvoker/bergamot/bench/MainActivity.kt
+index 129b63c..19c360c 100644
+--- a/sample/src/main/kotlin/io/github/yinvoker/bergamot/bench/MainActivity.kt
++++ b/sample/src/main/kotlin/io/github/yinvoker/bergamot/bench/MainActivity.kt
+@@ -48,7 +48,7 @@ class MainActivity : Activity() {
+             scope.launch {
+                 try {
+                     withContext(Dispatchers.Default) {
+-                        BenchRunner(this@MainActivity, intent.getIntExtra("threads", 1)) { line -> scope.launch { log(line) } }.run()
++                        BenchRunner(this@MainActivity, intent.getIntExtra("threads", 1), intent.getIntExtra("workspace", 128)) { line -> scope.launch { log(line) } }.run()
+                     }
+                     log("ALL DONE")
+                 } catch (e: Exception) {
+-- 
+2.54.0
+

@@ -1,0 +1,28 @@
+From 9454eb4a4ed03651495c83de39fed53dd138727e Mon Sep 17 00:00:00 2001
+From: yinvoker <yinvoker@outlook.com>
+Date: Mon, 31 Aug 2026 20:19:56 +0800
+Subject: [PATCH] patch: simd_utils missing <cfenv> for
+ FE_TOWARDZERO/FE_TONEAREST (libc++ 17+ no longer transitively includes it)
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ engine/marian-fork/src/3rd_party/simd_utils/simd_utils.h | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/engine/marian-fork/src/3rd_party/simd_utils/simd_utils.h b/engine/marian-fork/src/3rd_party/simd_utils/simd_utils.h
+index 19698a3..0d6752e 100644
+--- a/engine/marian-fork/src/3rd_party/simd_utils/simd_utils.h
++++ b/engine/marian-fork/src/3rd_party/simd_utils/simd_utils.h
+@@ -5,7 +5,8 @@
+  * Licence : BSD-2
+  */
+ 
+-#pragma once
++#pragma once
++#include <cfenv>
+ 
+ #ifdef __cplusplus
+ extern "C" {
+-- 
+2.54.0
+

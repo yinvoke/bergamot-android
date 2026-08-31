@@ -1,0 +1,49 @@
+From dda20b7125fbaa906495b86ffbb2bd30742b528d Mon Sep 17 00:00:00 2001
+From: yinvoker <yinvoker@outlook.com>
+Date: Mon, 31 Aug 2026 20:20:50 +0800
+Subject: [PATCH] patch: define ARM/FMA/SSE globally for the bergamot layer
+ (upstream bug)
+
+marian-fork adds these directory-scoped, but src/ is added before marian-fork,
+so bergamot-translator-source compiled without them and marian headers fell
+through to raw x86 intrinsics on ARM native builds. Upstream never notices
+because its CI covers WASM and x86 native only. Candidate for an upstream
+issue against mozilla/translations.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ engine/CMakeLists.txt | 15 +++++++++------
+ 1 file changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/engine/CMakeLists.txt b/engine/CMakeLists.txt
+index f4251ad..ed10b87 100644
+--- a/engine/CMakeLists.txt
++++ b/engine/CMakeLists.txt
+@@ -182,15 +182,18 @@ if(COMPILE_TESTS)
+     enable_testing()
+ endif(COMPILE_TESTS)
+ 
++# On ARM the marian-fork CMakeLists adds ARM/FMA/SSE + the matching options as
++# *directory-scoped* definitions, but marian-fork is added after src/ below, so
++# the bergamot layer (src/translator) never sees them and its includes of
++# marian headers hit raw x86 intrinsics. Define them globally here instead.
++if(NOT COMPILE_WASM AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|armv8)")
++  add_compile_definitions(ARM FMA SSE)
++  add_compile_options(-flax-vector-conversions -fno-strict-aliasing)
++endif()
++
+ add_subdirectory(3rd_party)
+ add_subdirectory(src)
+ 
+-if(COMPILE_WASM)
+-  add_subdirectory(wasm)
+-else()
+-  add_subdirectory(src/app)
+-endif(COMPILE_WASM)
+-
+ option(COMPILE_PYTHON "Compile python bindings. Intended to be activated with setup.py" OFF)
+ if(COMPILE_PYTHON)
+   add_subdirectory(bindings/python)
+-- 
+2.54.0
+

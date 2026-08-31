@@ -1,0 +1,31 @@
+From de1f3c206e935936f2b0a46d5f687e5e49de90b8 Mon Sep 17 00:00:00 2001
+From: yinvoker <yinvoker@outlook.com>
+Date: Mon, 31 Aug 2026 20:20:25 +0800
+Subject: [PATCH] patch: make non-ARM targets a hard configure error (ARM-only
+ by design)
+
+intgemm (x86 int8 GEMM) is deliberately not vendored; ruy is the sole GEMM
+backend. CI runs on ARM runners so the smoke test exercises the same NEON
+code path as devices.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ engine/marian-fork/CMakeLists.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/engine/marian-fork/CMakeLists.txt b/engine/marian-fork/CMakeLists.txt
+index e22af91..446fe7b 100644
+--- a/engine/marian-fork/CMakeLists.txt
++++ b/engine/marian-fork/CMakeLists.txt
+@@ -84,7 +84,7 @@ if(${CMAKE_TARGET_ARCHITECTURE_CODE} MATCHES "arm")
+   add_compile_definitions(ARM)
+   #
+ else()
+-  set(USE_INTGEMM ON)
++  message(FATAL_ERROR "bergamot-android is ARM-only: the x86 intgemm backend is not vendored. Build on an ARM host (Apple Silicon / ARM Linux) or for an ARM target.")
+ endif()
+ 
+ if(USE_INTGEMM)
+-- 
+2.54.0
+

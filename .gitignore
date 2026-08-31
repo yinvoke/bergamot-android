@@ -1,5 +1,15 @@
-build-host/
+# build outputs
 build/
+build-host/
+.cxx/
+*.apk
+*.aar
+
+# generated in-tree by marian cmake at configure time
+engine/marian-fork/src/common/git_revision.h
+engine/marian-fork/src/common/project_version.h
+
+# gradle / IDE / local machine
 .gradle/
 local.properties
 .idea/

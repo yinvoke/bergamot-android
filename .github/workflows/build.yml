@@ -1,0 +1,73 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # NDK 交叉编译在 x86 宿主上合法(目标是 arm64);ARM-only 门禁检查的是目标架构。
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - name: Install NDK and CMake
+        run: sdkmanager "ndk;29.0.13113456" "cmake;3.31.6"
+      - name: Unit tests + AAR + benchmark app
+        run: ./gradlew :bergamot:test :bergamot:assembleRelease :sample:assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bergamot-release-aar
+          path: bergamot/build/outputs/aar/bergamot-release.aar
+
+  # 主机冒烟工具须在 ARM 宿主构建(与设备同走 ruy/NEON 路径)。
+  host-smoke:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build smoke CLI
+        run: |
+          cmake -B build-host -DCMAKE_BUILD_TYPE=Release \
+            -DSSPLIT_USE_INTERNAL_PCRE2=ON -DCOMPILE_TESTS=OFF
+          cmake --build build-host -j 3 --target smoke
+      - name: Translate two sentences with a real model
+        run: |
+          mkdir -p models/enzh
+          python3 - <<'EOF'
+          import json, urllib.request
+          reg = json.load(open('registry.json'))
+          m = next(x for x in reg['models'] if x['from'] == 'en' and x['to'] == 'zh-Hans')
+          for f in m['files']:
+              urllib.request.urlretrieve(f['url'], 'models/enzh/' + f['name'])
+          EOF
+          printf 'Hello world.\nThis is a smoke test.\n' | \
+            ./build-host/tools/smoke/smoke <(cat <<EOF
+          models:
+            - $PWD/models/enzh/model.enzh.intgemm.alphas.bin
+          vocabs:
+            - $PWD/models/enzh/srcvocab.enzh.spm
+            - $PWD/models/enzh/trgvocab.enzh.spm
+          shortlist:
+            - $PWD/models/enzh/lex.50.50.enzh.s2t.bin
+            - false
+          beam-size: 1
+          normalize: 1.0
+          word-penalty: 0
+          max-length-break: 128
+          mini-batch-words: 1024
+          workspace: 128
+          max-length-factor: 2.0
+          skip-cost: true
+          cpu-threads: 0
+          quiet: true
+          quiet-translation: true
+          gemm-precision: int8shiftAlphaAll
+          alignment: soft
+          EOF
+          ) | tee out.txt
+          test "$(wc -l < out.txt)" -eq 2

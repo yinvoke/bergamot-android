@@ -1,0 +1,34 @@
+bergamot-android 自有代码按 MIT 许可(见 LICENSE);仓库同时捆绑了
+以下第三方组件。各组件在其目录内保留自身的
+许可文件,本文件是索引。
+
+引擎(vendor 自 https://github.com/mozilla/translations 的 inference/
+目录,commit df4ab487;其本身派生自
+https://github.com/browsermt/bergamot-translator):
+
+- Bergamot translator(engine/src/translator)— MPL-2.0
+- Marian NMT,browsermt fork(engine/marian-fork)— MIT,
+  见 engine/marian-fork/LICENSE.md
+- SentencePiece(engine/marian-fork/src/3rd_party/sentencepiece)— Apache-2.0
+- ruy(engine/marian-fork/src/3rd_party/ruy)— Apache-2.0
+- cpuinfo(engine/marian-fork/src/3rd_party/ruy/third_party/cpuinfo)— BSD-2-Clause
+- simd_utils(engine/marian-fork/src/3rd_party/simd_utils)— 见其目录
+- ssplit-cpp,裁剪至分句核心
+  (engine/3rd_party/ssplit-cpp)— Apache-2.0;其 nonbreaking_prefixes
+  数据源自 Moses 项目,按其自身条款分发。见
+  engine/3rd_party/ssplit-cpp/LICENSE.md
+- PCRE2 10.39(engine/3rd_party/ssplit-cpp/src/3rd-party/pcre2-10.39)— BSD
+- zlib、pathie-cpp、faiss 子集、half_float 等
+  engine/marian-fork/src/3rd_party 下的小型组件——见各自目录
+
+对以上 vendor 代码的全部本地改动存档于 patches/。
+
+数据:
+
+- sample/src/main/assets/bench 包含 FLORES-200 devtest 集的前 150 句
+  (https://github.com/facebookresearch/flores),CC-BY-SA 4.0。
+- registry.json 索引 Mozilla 经 Firefox Remote Settings 发布的官方
+  翻译模型(MPL-2.0)。
+
+感谢 Bergamot 项目(EU Horizon 2020,grant 825303)、Mozilla,以及
+上述所有组件的作者。

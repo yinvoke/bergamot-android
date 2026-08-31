@@ -23,6 +23,7 @@ copied in as plain files: `sentencepiece`, `ruy`, `simd_utils` (under
 | `marian-fork/src/3rd_party/intgemm` | x86 int8 GEMM; this repo is ARM-only by design (ruy is the sole GEMM backend) |
 | `marian-fork/src/3rd_party/{fbgemm,nccl,onnxjs,simple-websocket-server}` | x86 / CUDA / WASM / server-only; verified unnecessary for native ARM builds |
 | `marian-fork/src/tests`, `regression-tests`, `examples` | upstream tests |
+| `marian-fork/src/3rd_party/catch.hpp`, `ruy/third_party/googletest` | test-only frameworks; builds are configured with tests off |
 | `ssplit-cpp`: everything except `src/ssplit/` core (5 files), `nonbreaking_prefixes/`, in-tree `pcre2-10.39`, `cmake/`, `CMakeLists.txt`, `LICENSE.md`, `README.md` | dev tooling and its own CLI |
 
 ## Local changes

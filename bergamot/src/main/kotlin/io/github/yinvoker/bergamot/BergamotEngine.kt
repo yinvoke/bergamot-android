@@ -58,8 +58,6 @@ class EngineConfig(
     val threads: Int = 1,
     /** Marian workspace per worker, MB. Smaller = less RAM, may cost speed. */
     val workspaceMb: Int = 128,
-    
-    
     /** Unload a model after this long without use. */
     val idleUnloadMillis: Long = 60_000,
 )

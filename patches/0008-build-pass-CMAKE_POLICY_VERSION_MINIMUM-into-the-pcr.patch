@@ -1,0 +1,125 @@
+From c2d961d7e4e9d8c3e94235646ace708f747bed29 Mon Sep 17 00:00:00 2001
+From: yinvoker <yinvoker@outlook.com>
+Date: Mon, 31 Aug 2026 20:23:15 +0800
+Subject: [PATCH] build: pass CMAKE_POLICY_VERSION_MINIMUM into the pcre2
+ external project; restore trimmed 3rd_party CMakeLists
+
+The pcre2 sub-configure is a separate cmake process and does not inherit the
+policy floor set by the top-level lists file.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                                | 16 ++++++++
+ engine/3rd_party/CMakeLists.txt               |  6 +++
+ .../ssplit-cpp/cmake/FindPCRE2.cmake          |  1 +
+ tools/smoke/CMakeLists.txt                    |  3 ++
+ tools/smoke/smoke.cpp                         | 39 +++++++++++++++++++
+ 5 files changed, 65 insertions(+)
+ create mode 100644 CMakeLists.txt
+ create mode 100644 engine/3rd_party/CMakeLists.txt
+ create mode 100644 tools/smoke/CMakeLists.txt
+ create mode 100644 tools/smoke/smoke.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+new file mode 100644
+index 0000000..fbb8c02
+--- /dev/null
++++ b/CMakeLists.txt
+@@ -0,0 +1,16 @@
++# Native build entry. Consumed two ways:
++#   - host (ARM only): engine + tools/smoke, driven by plain cmake
++#   - Android: engine + jni, driven by AGP externalNativeBuild (see bergamot/)
++cmake_minimum_required(VERSION 3.22)
++project(bergamot_android CXX C)
++
++# Old cmake_minimum_required() calls throughout the vendored tree.
++set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
++
++add_subdirectory(engine)
++
++if(ANDROID)
++  add_subdirectory(jni)
++else()
++  add_subdirectory(tools/smoke)
++endif()
+diff --git a/engine/3rd_party/CMakeLists.txt b/engine/3rd_party/CMakeLists.txt
+new file mode 100644
+index 0000000..dd44e8d
+--- /dev/null
++++ b/engine/3rd_party/CMakeLists.txt
+@@ -0,0 +1,6 @@
++# bergamot-android: trimmed from upstream (WASM branch removed).
++set(COMPILE_TESTS OFF)
++
++add_subdirectory(ssplit-cpp EXCLUDE_FROM_ALL)
++get_property(INCLUDE_DIRECTORIES DIRECTORY ssplit-cpp/src PROPERTY INCLUDE_DIRECTORIES)
++target_include_directories(ssplit PUBLIC ${INCLUDE_DIRECTORIES})
+diff --git a/engine/3rd_party/ssplit-cpp/cmake/FindPCRE2.cmake b/engine/3rd_party/ssplit-cpp/cmake/FindPCRE2.cmake
+index 8ea55cb..f4dab22 100644
+--- a/engine/3rd_party/ssplit-cpp/cmake/FindPCRE2.cmake
++++ b/engine/3rd_party/ssplit-cpp/cmake/FindPCRE2.cmake
+@@ -51,6 +51,7 @@ if(SSPLIT_USE_INTERNAL_PCRE2)
+     -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE} # Necessary for proper MacOS compilation
+     -DCMAKE_CROSSCOMPILING_EMULATOR=${CMAKE_CROSSCOMPILING_EMULATOR_WITH_SEMICOLON} # Necessary for proper MacOS compilation
+     -DCMAKE_POSITION_INDEPENDENT_CODE:BOOL=true # Added for pybind11
++    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 # pcre2 10.39 declares cmake_minimum_required <3.5, rejected by cmake 4
+     )
+ 
+   # Android platform needs to be explicitly passed given this is an external project.
+diff --git a/tools/smoke/CMakeLists.txt b/tools/smoke/CMakeLists.txt
+new file mode 100644
+index 0000000..43d5ed8
+--- /dev/null
++++ b/tools/smoke/CMakeLists.txt
+@@ -0,0 +1,3 @@
++add_executable(smoke smoke.cpp)
++target_include_directories(smoke PRIVATE ${CMAKE_SOURCE_DIR}/engine/src)
++target_link_libraries(smoke bergamot-translator-source)
+diff --git a/tools/smoke/smoke.cpp b/tools/smoke/smoke.cpp
+new file mode 100644
+index 0000000..f5658ff
+--- /dev/null
++++ b/tools/smoke/smoke.cpp
+@@ -0,0 +1,39 @@
++// Host smoke tool. Not a deliverable: exists so CI can catch a broken engine
++// patch in seconds, on the same ruy/NEON code path devices use.
++//
++// Usage: smoke <model-config.yml> [<second-config.yml>] < text-lines
++//   One input line = one source text, translated as a batch (mirrors the JNI
++//   surface). With a second config, translates via pivot (first -> second).
++#include <iostream>
++#include <string>
++#include <vector>
++
++#include "translator/parser.h"
++#include "translator/response.h"
++#include "translator/response_options.h"
++#include "translator/service.h"
++
++int main(int argc, char *argv[]) {
++  using namespace marian::bergamot;
++  if (argc < 2 || argc > 3) {
++    std::cerr << "usage: smoke <model-config.yml> [<second-config.yml>] < text-lines\n";
++    return 2;
++  }
++
++  BlockingService service{BlockingService::Config{}};
++  auto makeModel = [&](const char *path) {
++    return std::make_shared<TranslationModel>(parseOptionsFromFilePath(path));
++  };
++  auto model = makeModel(argv[1]);
++
++  std::vector<std::string> sources;
++  for (std::string line; std::getline(std::cin, line);) sources.push_back(line);
++  std::vector<ResponseOptions> options(sources.size());
++
++  std::vector<Response> responses =
++      (argc == 3) ? service.pivotMultiple(model, makeModel(argv[2]), std::move(sources), options)
++                  : service.translateMultiple(model, std::move(sources), options);
++
++  for (auto &response : responses) std::cout << response.target.text << "\n";
++  return 0;
++}
+-- 
+2.54.0
+
