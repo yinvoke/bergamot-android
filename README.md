@@ -281,8 +281,8 @@ adb shell am start -n io.github.yinvoker.bergamot.bench/.MainActivity \
 ## 🗺️ Roadmap
 
 - [x] 基础引擎 + NDK 构建,并完成真机测试
-- [ ] CI(构建与测试)
-- [ ] 发布 AAR 构件
+- [x] CI(构建与测试)
+- [x] 发布 AAR 构件
 - [ ] HTML 模式验证(`html = true` 已接通,待基准)
 - [ ] 性能优化
 
