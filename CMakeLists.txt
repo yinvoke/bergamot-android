@@ -7,6 +7,21 @@ project(bergamot_android CXX C)
 # Old cmake_minimum_required() calls throughout the vendored tree.
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Consumers outside engine/ (tools/smoke, jni/) include marian/bergamot/ssplit
+# headers, whose contents are shaped by these macros. The vendored tree sets
+# them directory-scoped only, so sibling directories must match them here or
+# header code paths diverge from the compiled engine (raw x86 intrinsics on
+# ARM, wrong string_view, etc.). Mirrors the flag set the engine itself is
+# built with.
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|armv8)")
+  message(FATAL_ERROR "bergamot-android is ARM-only (see engine/UPSTREAM.md)")
+endif()
+add_compile_definitions(ARM FMA SSE COMPILE_CPU=1 USE_PTHREADS USE_SENTENCEPIECE _USE_INTERNAL_STRING_VIEW)
+add_compile_options(-flax-vector-conversions -fno-strict-aliasing)
+
 add_subdirectory(engine)
 
 if(ANDROID)
