@@ -31,6 +31,7 @@ TranslationModel::TranslationModel(const Config &options, MemoryBundle &&memory 
       qualityEstimator_(createQualityEstimator(getQualityEstimatorModel(memory, options))) {
   ABORT_IF(replicas == 0, "At least one replica needs to be created.");
   backend_.resize(replicas);
+  modelMemory_ = std::make_shared<std::vector<AlignedMemory>>(std::move(memory_.models));
 
   // Try to load shortlist from memory-bundle. If not available, try to load from options_;
 
@@ -71,12 +72,17 @@ void TranslationModel::loadBackend(size_t idx) {
   graph->getBackend()->configureDevice(options_);
   graph->reserveWorkspaceMB(5);
 
-  // if memory_.models is populated, then all models were of binary format
-  if (memory_.models.size() >= 1) {
+  // Pin the model bytes for the duration of this load; concurrent loads each
+  // hold their own reference, so the release below can never free bytes a
+  // sibling worker is still reading.
+  std::shared_ptr<std::vector<AlignedMemory>> modelMemory = std::atomic_load(&modelMemory_);
+
+  // if the model memory is populated, then all models were of binary format
+  if (modelMemory && modelMemory->size() >= 1) {
     const std::vector<const void *> container = std::invoke([&]() {
-      std::vector<const void *> model_ptrs(memory_.models.size());
-      for (size_t i = 0; i < memory_.models.size(); ++i) {
-        const AlignedMemory &model = memory_.models[i];
+      std::vector<const void *> model_ptrs(modelMemory->size());
+      for (size_t i = 0; i < modelMemory->size(); ++i) {
+        const AlignedMemory &model = (*modelMemory)[i];
 
         ABORT_IF(model.size() == 0 || model.begin() == nullptr, "The provided memory is empty. Cannot load the model.");
         ABORT_IF(
@@ -118,9 +124,14 @@ void TranslationModel::loadBackend(size_t idx) {
     scorer->clearItems();
   }
 
-  // Similarly to the scorers, there is an extra copy of the model in the MemoryBundle. Since
-  // the ExpressionGraph is loaded, it is relatively safe to clear this memory.
-  memory_.models.clear();
+  // Similarly to the scorers, there is an extra copy of the model bytes. Drop
+  // the shared reference only once every replica has loaded — an earlier
+  // clear would force later replicas back to disk (or, unsynchronized, hand
+  // them freed memory). Replicas that loaded concurrently keep their own pin
+  // until they leave this function.
+  if (backendsLoaded_.fetch_add(1) + 1 == backend_.size()) {
+    std::atomic_store(&modelMemory_, std::shared_ptr<std::vector<AlignedMemory>>());
+  }
 }
 
 // Make request process is shared between Async and Blocking workflow of translating.

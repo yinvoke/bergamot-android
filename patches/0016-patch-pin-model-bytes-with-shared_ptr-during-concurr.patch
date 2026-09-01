@@ -1,0 +1,99 @@
+From 86a28ee0ec460649250c7f25dc406dfe5ecda720 Mon Sep 17 00:00:00 2001
+From: yinvoker <yinvoker@outlook.com>
+Date: Tue, 1 Sep 2026 17:42:58 +0800
+Subject: [PATCH] patch: pin model bytes with shared_ptr during concurrent
+ replica loads
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+memory_.models.clear() at the end of the first loadBackend freed the
+bundle while sibling workers were still reading it (lazy loads run
+concurrently; unsynchronized read-after-free). With worker pinning the
+race became reliably fatal: threads=4 in-app SIGABRTed on the binary
+version check inside loadItems. Model bytes now live behind a
+shared_ptr; each loadBackend pins a reference and the last replica to
+load drops the shared one — same steady-state memory, no serialization
+of loads. Host hashes unchanged (enzh 1728c7c8, ja->zh 58b6667d), w4
+stable, device 4t app run passes.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ engine/src/translator/translation_model.cpp | 27 +++++++++++++++------
+ engine/src/translator/translation_model.h   |  7 ++++++
+ 2 files changed, 26 insertions(+), 8 deletions(-)
+
+diff --git a/engine/src/translator/translation_model.cpp b/engine/src/translator/translation_model.cpp
+index 140d440..294c738 100644
+--- a/engine/src/translator/translation_model.cpp
++++ b/engine/src/translator/translation_model.cpp
+@@ -31,6 +31,7 @@ TranslationModel::TranslationModel(const Config &options, MemoryBundle &&memory
+       qualityEstimator_(createQualityEstimator(getQualityEstimatorModel(memory, options))) {
+   ABORT_IF(replicas == 0, "At least one replica needs to be created.");
+   backend_.resize(replicas);
++  modelMemory_ = std::make_shared<std::vector<AlignedMemory>>(std::move(memory_.models));
+ 
+   // Try to load shortlist from memory-bundle. If not available, try to load from options_;
+ 
+@@ -71,12 +72,17 @@ void TranslationModel::loadBackend(size_t idx) {
+   graph->getBackend()->configureDevice(options_);
+   graph->reserveWorkspaceMB(5);
+ 
+-  // if memory_.models is populated, then all models were of binary format
+-  if (memory_.models.size() >= 1) {
++  // Pin the model bytes for the duration of this load; concurrent loads each
++  // hold their own reference, so the release below can never free bytes a
++  // sibling worker is still reading.
++  std::shared_ptr<std::vector<AlignedMemory>> modelMemory = std::atomic_load(&modelMemory_);
++
++  // if the model memory is populated, then all models were of binary format
++  if (modelMemory && modelMemory->size() >= 1) {
+     const std::vector<const void *> container = std::invoke([&]() {
+-      std::vector<const void *> model_ptrs(memory_.models.size());
+-      for (size_t i = 0; i < memory_.models.size(); ++i) {
+-        const AlignedMemory &model = memory_.models[i];
++      std::vector<const void *> model_ptrs(modelMemory->size());
++      for (size_t i = 0; i < modelMemory->size(); ++i) {
++        const AlignedMemory &model = (*modelMemory)[i];
+ 
+         ABORT_IF(model.size() == 0 || model.begin() == nullptr, "The provided memory is empty. Cannot load the model.");
+         ABORT_IF(
+@@ -118,9 +124,14 @@ void TranslationModel::loadBackend(size_t idx) {
+     scorer->clearItems();
+   }
+ 
+-  // Similarly to the scorers, there is an extra copy of the model in the MemoryBundle. Since
+-  // the ExpressionGraph is loaded, it is relatively safe to clear this memory.
+-  memory_.models.clear();
++  // Similarly to the scorers, there is an extra copy of the model bytes. Drop
++  // the shared reference only once every replica has loaded — an earlier
++  // clear would force later replicas back to disk (or, unsynchronized, hand
++  // them freed memory). Replicas that loaded concurrently keep their own pin
++  // until they leave this function.
++  if (backendsLoaded_.fetch_add(1) + 1 == backend_.size()) {
++    std::atomic_store(&modelMemory_, std::shared_ptr<std::vector<AlignedMemory>>());
++  }
+ }
+ 
+ // Make request process is shared between Async and Blocking workflow of translating.
+diff --git a/engine/src/translator/translation_model.h b/engine/src/translator/translation_model.h
+index 0ea4ec1..d5298bb 100644
+--- a/engine/src/translator/translation_model.h
++++ b/engine/src/translator/translation_model.h
+@@ -147,6 +147,13 @@ class TranslationModel {
+   /// Hold replicas of the backend (graph, scorers, shortlist) for use in each thread.
+   /// Controlled and consistent external access via graph(id), scorerEnsemble(id),
+   std::vector<MarianBackend> backend_;
++
++  /// Model-file bytes behind a shared_ptr: worker threads lazy-load replicas
++  /// concurrently, so a plain member vector freed by the first finisher (the
++  /// old memory_.models.clear()) is read-after-free for the others. Each
++  /// loadBackend pins a reference; the last replica to load drops this one.
++  std::shared_ptr<std::vector<AlignedMemory>> modelMemory_;
++  std::atomic<size_t> backendsLoaded_{0};
+   std::shared_ptr<QualityEstimator> qualityEstimator_;
+ 
+   void loadBackend(size_t idx);
+-- 
+2.54.0
+

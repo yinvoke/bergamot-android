@@ -147,6 +147,13 @@ class TranslationModel {
   /// Hold replicas of the backend (graph, scorers, shortlist) for use in each thread.
   /// Controlled and consistent external access via graph(id), scorerEnsemble(id),
   std::vector<MarianBackend> backend_;
+
+  /// Model-file bytes behind a shared_ptr: worker threads lazy-load replicas
+  /// concurrently, so a plain member vector freed by the first finisher (the
+  /// old memory_.models.clear()) is read-after-free for the others. Each
+  /// loadBackend pins a reference; the last replica to load drops this one.
+  std::shared_ptr<std::vector<AlignedMemory>> modelMemory_;
+  std::atomic<size_t> backendsLoaded_{0};
   std::shared_ptr<QualityEstimator> qualityEstimator_;
 
   void loadBackend(size_t idx);
