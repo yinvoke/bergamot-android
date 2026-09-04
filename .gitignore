@@ -27,3 +27,4 @@ build-*.log
 docs/*
 !docs/benchmark-mi10.png
 !docs/benchmark-mi14.png
+!docs/smmla-compatibility.md

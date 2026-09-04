@@ -193,7 +193,7 @@ engine/        Bergamot 引擎,vendor 自 mozilla/translations(来源与升级�
 patches/       对上游的全部本地改动,git 补丁形式存档
 jni/           C++ 胶水层:批量进出,走 AsyncService
 bergamot/      Android 库(Kotlin suspend API)→ AAR
-tools/         测试工具(不随库发布):smoke CLI(主机 / adb shell 基准)、regress-hash.sh 哈希回归、i8mm 微基准
+tools/         测试工具(不随库发布):smoke CLI(主机 / adb shell 基准)、regress-hash.sh 哈希回归、smmla-test(SMMLA 内核测试集与形状级 A/B)、i8mm 微基准
 sample/        基准测试 app:ML Kit vs Bergamot,内存/CPU 曲线,JSON 导出
 registry.json  Mozilla 模型下载索引(每个方向的 URL / sha256 / 大小)
 ```
@@ -284,7 +284,8 @@ adb shell am start -n io.github.yinvoker.bergamot.bench/.MainActivity \
 - [x] CI(构建与测试)
 - [x] 发布 AAR 构件
 - [ ] HTML 模式验证(`html = true` 已接通,待基准)
-- [ ] GEMM 内核计算优化
+- [x] GEMM 内核计算优化:ruy 上下文跨调用复用与常量权重预打包缓存;Armv8.6 i8mm **SMMLA int8 内核**,按 CPU 运行时门控,无 i8mm 机型自动回退 ruy,译文逐字节不变(8 Gen 3 单句 1.35×、8 Gen 1 blocking 1.26×;已验证设备见 [docs/smmla-compatibility.md](docs/smmla-compatibility.md))
+- [ ] SME2 指令集兼容:Armv9.2 SME2 外积内核(ZA 瓦片做 int8 外积),密度比 SMMLA 再高一档,批量预计约 1.4×;等有 SME2 的设备(天玑 9500 / Exynos 2600 起,高通 Oryon 无 SME)
 - [ ] 非 GEMM 计算部分优化
 - [ ] 参数调优
 - [ ] 内存优化
