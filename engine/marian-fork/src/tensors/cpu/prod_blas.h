@@ -53,7 +53,10 @@ inline void GemmRuy(const bool transA,
                     const float beta,
                     float *C,
                     const int ldc) {
-  ruy::Context context;
+  // PATCH A: see ruy_interface.h -- one Context per thread, not per call.
+  // No cache policy is set here on purpose: the float path multiplies
+  // activations, which change every call and must never be cached.
+  static thread_local ruy::Context context;
 
   // If we need to transpose, we can swap dimensions in layout claim the matrix
   // is just column-major. Set ordering so transpose.

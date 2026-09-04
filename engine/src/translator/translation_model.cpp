@@ -8,6 +8,7 @@
 #include "data/text_input.h"
 #include "html.h"
 #include "parser.h"
+#include "tensors/cpu/integer_common.h"  // PATCH B: prepack generation counter
 #include "translator/beam_search.h"
 
 namespace marian {
@@ -52,6 +53,11 @@ TranslationModel::TranslationModel(const Config &options, MemoryBundle &&memory 
     shortlistGenerator_ = nullptr;
   }
 }
+
+// PATCH B: see translation_model.h. Bumping here makes every worker thread drop
+// its ruy prepacked-weight cache before any replacement model can be handed the
+// freed weight addresses.
+TranslationModel::~TranslationModel() { marian::cpu::integer::bumpPrepackGeneration(); }
 
 void TranslationModel::loadBackend(size_t idx) {
   auto &graph = backend_[idx].graph;

@@ -20,12 +20,29 @@
 #include "wasm_intgemm_interface.h"
 #endif
 
+#include <atomic>
 #include <cassert>
+#include <cstdint>
 #include <cstddef>
 
 namespace marian {
 namespace cpu {
 namespace integer {
+
+// PATCH B: staleness guard for ruy's per-thread prepacked-weight cache.
+//
+// The cache is keyed on {src data pointer, packed layout, zero point} and does
+// NOT hash the buffer contents. A freed model whose weight allocation is later
+// handed back for a different model would therefore silently hit a stale
+// packed buffer. Every TranslationModel destruction bumps this counter; each
+// worker thread compares it against the generation it last packed under and
+// drops its whole prepacked cache on a mismatch.
+//
+// Relaxed ordering is sufficient: the value is only ever compared for
+// inequality against a thread-local snapshot, and model teardown is already
+// ordered against translation by the service's own synchronisation.
+std::atomic<uint64_t> &prepackGeneration();
+void bumpPrepackGeneration();
 
 // Making sure we have access to common functions for RUY and INTGEMM
 class fetchAlphaFromModelNodeOp : public UnaryNodeOp {

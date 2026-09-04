@@ -12,6 +12,18 @@
 namespace marian {
 namespace cpu {
 namespace integer {
+
+// PATCH B: see integer_common.h. Function-local static so the counter is
+// initialised on first use regardless of translation-unit ordering.
+std::atomic<uint64_t> &prepackGeneration() {
+  static std::atomic<uint64_t> generation{0};
+  return generation;
+}
+
+void bumpPrepackGeneration() {
+  prepackGeneration().fetch_add(1, std::memory_order_relaxed);
+}
+
 // This operates on floats after processing so doesn't care about int8_t vs int16_t.
 void AddBias(marian::Tensor C, const marian::Tensor Bias) {
   float* y = C->data();

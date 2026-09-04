@@ -196,7 +196,8 @@ inline void transpose(const int8_t *input, Index rows, Index cols, int8_t *outpu
                          Index width,
                          Index cols_B,
                          float unquant_multiplier,
-                         float * bias=nullptr) {
+                         float * bias=nullptr,
+                         bool cacheableB=false) {
       // It is expected that somehow we have managed to call all prepare by the time
       // we are here, with inputs (prepared) in int8_t. All that's left to do is use
       // ruy for multiply and then start with the reverse ops to get to fp32.
@@ -205,7 +206,24 @@ inline void transpose(const int8_t *input, Index rows, Index cols, int8_t *outpu
       // The following is adapted from
       // https://github.com/google/ruy/blob/878283640de7946a43053e8ebf4f15114fbc9156/example/example.cc#L129-L152
 
-      ruy::Context context;
+      // PATCH A: one ruy::Context per thread instead of one per GEMM call.
+      // A Context owns a thread pool, allocators and the prepacked cache;
+      // rebuilding it on every matmul is pure overhead. Context is not
+      // thread-safe, so thread_local is the matching lifetime -- it maps 1:1
+      // onto the AsyncService worker model (same approach CTranslate2 takes).
+      static thread_local ruy::Context context;
+
+      // PATCH B: drop this thread's prepacked weights when any model has been
+      // torn down since we last packed. Cheap: one relaxed atomic load per
+      // GEMM, and the clear only ever runs on the generation change.
+      static thread_local uint64_t seenGeneration = 0;
+      const uint64_t generation =
+          prepackGeneration().load(std::memory_order_relaxed);
+      if (generation != seenGeneration) {
+        context.ClearPrepackedCache();
+        seenGeneration = generation;
+      }
+
       ruy::Matrix<std::int8_t> lhs;
       ruy::MakeSimpleLayout(rows_A, width, ruy::Order::kRowMajor, lhs.mutable_layout());
       lhs.set_data(input_A_prepared);
@@ -213,6 +231,17 @@ inline void transpose(const int8_t *input, Index rows, Index cols, int8_t *outpu
       ruy::Matrix<std::int8_t> rhs;
       ruy::MakeSimpleLayout(width, cols_B, ruy::Order::kColMajor, rhs.mutable_layout());
       rhs.set_data(input_B_prepared);
+      // PATCH B: B holds constant model weights whenever the caller says so, so
+      // ruy may keep the packed form across calls instead of re-packing every
+      // GEMM. Because dst is row-major, ruy transposes internally and this
+      // operand lands on Side::kLhs -- the policy travels with the matrix, so
+      // setting it here is correct. A shortlist-selected B (RuySelectColumnsB)
+      // reuses one buffer with changing contents and must stay uncached; the
+      // cache key is only {data pointer, packed layout, zero point} and would
+      // not notice the change.
+      if (cacheableB) {
+        rhs.set_cache_policy(ruy::CachePolicy::kAlwaysCache);
+      }
 
       ruy::Matrix<std::int32_t> dst;
       ruy::MakeSimpleLayout(rows_A, cols_B, ruy::Order::kRowMajor, dst.mutable_layout());
@@ -457,6 +486,11 @@ public:
     return { [=]() {
           float aQuantMult = std::static_pointer_cast<PrepareNode >(child(0))->quantMult_;
           float bQuantMult;
+          // PATCH B: a RuySelectColumnsB child rewrites one reused buffer every
+          // step (shortlist column selection), so its packed form must never be
+          // cached. The other two cases -- a memoized RuyPrepareB and an already
+          // prepared parameter tensor -- are constant for the model's lifetime.
+          bool cacheableB = child(1)->type() != "RuySelectColumnsB";
           if (child(1)->type() == "RuySelectColumnsB") {
             bQuantMult = std::static_pointer_cast<SelectColumnsBRuyNodeOp>(child(1))->quantMult_;
           } else if (child(1)->type() == "RuyPrepareB") {
@@ -478,7 +512,8 @@ public:
                                       cols(child(0)->val()),
                                       cols(child(1)->val()),
                                       unquant_mult,
-                                      bias);
+                                      bias,
+                                      cacheableB);
     }};
   }
 

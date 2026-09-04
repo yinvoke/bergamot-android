@@ -62,6 +62,12 @@ class TranslationModel {
   TranslationModel(const Config& options, size_t replicas = 1)
       : TranslationModel(options, getMemoryBundleFromConfig(options), replicas) {}
 
+  /// PATCH B: invalidates every worker's cached prepacked weights. The weight
+  /// allocation this model owns is about to be freed, and ruy's prepacked cache
+  /// keys on the source data pointer -- a later model handed the same address
+  /// would otherwise hit a stale packed buffer.
+  ~TranslationModel();
+
   /// Make a Request to be translated by this TranslationModel instance.
   /// @param [in] requestId: Unique identifier associated with this request, available from Service.
   /// @param [in] source: Source text to be translated. Ownership is accepted and eventually returned to the client in
