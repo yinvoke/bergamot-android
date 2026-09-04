@@ -5,9 +5,10 @@
 # hash -- this is the correctness gate for the whole engine, no COMET needed.
 #   regress-hash.sh <smoke> <enzh-config.yml> <eng.txt> [<jaen-config.yml> <jpn.txt>]
 # Env: EXPECT_ENZH / EXPECT_PIVOT override the built-in table; PLATFORM=host|device
-# The pivot hash is only stable on an engine that carries patch 0012 (requests
-# ordered by id, not heap address); without it the ja->zh output differs run to
-# run even in blocking mode, so on such an engine check en->zh only.
+# Every canonical hash below assumes patch 0012 (requests ordered by id, not
+# heap address): without it batch composition follows allocator addresses --
+# ja->zh differs run to run on the host, and on Android even en->zh lands on a
+# different (stable) output. Engines without 0012 cannot use this table.
 set -euo pipefail
 smoke=${1:?smoke}; enzh=${2:?enzh config}; eng=${3:?eng.txt}
 jaen=${4:-}; jpn=${5:-}
@@ -23,7 +24,7 @@ case "$platform/$n" in
   host/150)   can_enzh=1728c7c863926c5c; can_pivot=58b6667dd43d6364 ;;
   host/200)   can_enzh=3b458f7f7fe6fd68; can_pivot=00602a479d7c106b ;;
   device/150) can_enzh=1742b57a069b1da7; can_pivot=28028fc1ed7d0099 ;;
-  device/200) can_enzh=; can_pivot= ;;   # not baselined yet: run once, then fill in
+  device/200) can_enzh=f8a315e6571cc957; can_pivot=fb3dda796b1186af ;;   # Mi 10 (865, ruy path) 2026-09-04
   host/*|device/*) can_enzh=; can_pivot= ;;
   *) echo "unknown PLATFORM=$platform"; exit 2 ;;
 esac

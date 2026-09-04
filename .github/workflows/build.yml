@@ -33,8 +33,13 @@ jobs:
       - name: Build smoke CLI
         run: |
           cmake -B build-host -DCMAKE_BUILD_TYPE=Release \
-            -DSSPLIT_USE_INTERNAL_PCRE2=ON -DCOMPILE_TESTS=OFF
-          cmake --build build-host -j 3 --target smoke
+            -DSSPLIT_USE_INTERNAL_PCRE2=ON -DCOMPILE_TESTS=OFF -DBUILD_SMMLA_TEST=ON
+          cmake --build build-host -j 3 --target smoke --target smmla_test
+      - name: SMMLA GEMM test set (Apple Silicon runner has i8mm; coverage is required)
+        run: |
+          SMMLA_TEST_REQUIRE_I8MM=1 ctest --test-dir build-host --output-on-failure
+          BERGAMOT_NO_I8MM=1 ./build-host/tools/smmla-test/smmla_test --killswitch-probe
+          tools/smmla-test/check-opcodes.sh build-host/tools/smoke/smoke "$(xcrun -f llvm-objdump)"
       - name: Translate two sentences with a real model
         run: |
           mkdir -p models/enzh

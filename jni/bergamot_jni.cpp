@@ -7,6 +7,7 @@
 
 #include "ruy/context.h"
 #include "ruy/cpuinfo.h"
+#include "tensors/cpu/smmla_gemm.h"
 
 #include <condition_variable>
 #include <memory>
@@ -94,10 +95,13 @@ Java_io_github_yinvoker_bergamot_NativeBridge_createService(JNIEnv *env, jobject
     {
       ruy::Context probe;
       ruy::CpuInfo cpuInfo;
+      // smmla=1 means the app-sandbox HWCAP read saw i8mm and the SMMLA GEMM
+      // path is live in this process (0 = ruy SDOT fallback).
       __android_log_print(ANDROID_LOG_INFO, "bergamot",
-                          "ruy runtime paths=0x%x dotprod=%d",
+                          "ruy runtime paths=0x%x dotprod=%d smmla=%d",
                           static_cast<int>(probe.get_runtime_enabled_paths()),
-                          cpuInfo.NeonDotprod() ? 1 : 0);
+                          cpuInfo.NeonDotprod() ? 1 : 0,
+                          marian::cpu::integer::smmla::available() ? 1 : 0);
     }
     AsyncService::Config config;
     config.numWorkers = workers < 1 ? 1 : static_cast<size_t>(workers);
