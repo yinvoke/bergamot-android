@@ -57,7 +57,7 @@ class BenchRunner(
             .put("pssMinMb", Math.round(pss.min() / 1024.0 * 10) / 10.0)
     }
 
-    suspend fun run(): File {
+    suspend fun run(): JSONObject {
         val baseline = sampleBaseline()
         val eng = asset("eng.txt")
         val jpn = asset("jpn.txt")
@@ -121,8 +121,14 @@ class BenchRunner(
         // Mirror into internal storage: on Android 14+ neither shell nor run-as
         // can read the external app dir, so this copy is what adb collects.
         File(context.filesDir, out.name).writeText(result.toString())
+        // Timestamped record for the in-app history screen (fixed names above
+        // keep overwriting so adb collection scripts stay unchanged).
+        val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
+            .format(java.util.Date(result.getLong("timestamp")))
+        File(File(context.filesDir, "records").apply { mkdirs() }, "bench_${stamp}_${bergamotThreads}t$suffix.json")
+            .writeText(result.toString())
         log("done -> ${out.absolutePath}")
-        return out
+        return result
     }
 
     private fun mlkitPhase(name: String, sourceLang: String, texts: List<String>): JSONObject {

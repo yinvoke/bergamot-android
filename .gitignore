@@ -9,9 +9,21 @@ build-host/
 engine/marian-fork/src/common/git_revision.h
 engine/marian-fork/src/common/project_version.h
 
+# downloaded models and local bench output (never committed)
+models/
+bench-*.txt
+
 # gradle / IDE / local machine
+.claude/
 .gradle/
 local.properties
 .idea/
 *.iml
 .DS_Store
+build-android/
+build-*.log
+
+# research notes stay local; only the two benchmark charts the README embeds are tracked
+docs/*
+!docs/benchmark-mi10.png
+!docs/benchmark-mi14.png

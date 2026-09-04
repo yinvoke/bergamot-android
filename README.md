@@ -193,7 +193,7 @@ engine/        Bergamot 引擎,vendor 自 mozilla/translations(来源与升级�
 patches/       对上游的全部本地改动,git 补丁形式存档
 jni/           C++ 胶水层:批量进出,走 AsyncService
 bergamot/      Android 库(Kotlin suspend API)→ AAR
-tools/smoke    主机端 CLI,供 CI / 开发做正确性与性能冒烟(不随库发布)
+tools/         测试工具(不随库发布):smoke CLI(主机 / adb shell 基准)、regress-hash.sh 哈希回归、i8mm 微基准
 sample/        基准测试 app:ML Kit vs Bergamot,内存/CPU 曲线,JSON 导出
 registry.json  Mozilla 模型下载索引(每个方向的 URL / sha256 / 大小)
 ```
@@ -284,7 +284,12 @@ adb shell am start -n io.github.yinvoker.bergamot.bench/.MainActivity \
 - [x] CI(构建与测试)
 - [x] 发布 AAR 构件
 - [ ] HTML 模式验证(`html = true` 已接通,待基准)
-- [ ] 性能优化
+- [ ] GEMM 内核计算优化
+- [ ] 非 GEMM 计算部分优化
+- [ ] 参数调优
+- [ ] 内存优化
+- [ ] 多线程与调度优化
+- [ ] 构建优化
 
 ## 📄 许可
 
