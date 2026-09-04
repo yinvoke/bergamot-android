@@ -59,6 +59,7 @@ set(MARIAN_SOURCES
   tensors/cpu/tensor_operators.cpp
   
   tensors/cpu/integer_common.cpp
+  tensors/cpu/smmla_gemm.cpp
   tensors/cpu/wasm_intgemm_fallback.cpp
 
   graph/expression_graph.cpp
@@ -126,6 +127,13 @@ if (NOT USE_WASM_COMPATIBLE_SOURCE)
       tensors/cpu/fbgemm/packed_gemm.cpp
     )
   endif(USE_FBGEMM)
+endif()
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|armv8)")
+  # i8mm kernels live in one TU, runtime-gated on HWCAP2_I8MM; the raised
+  # -march must not leak into other TUs (baseline stays armv8-a for A55).
+  set_source_files_properties(tensors/cpu/smmla_gemm.cpp PROPERTIES
+    COMPILE_OPTIONS "-march=armv8.2-a+dotprod+i8mm")
 endif()
 
 add_library(marian STATIC ${MARIAN_SOURCES})

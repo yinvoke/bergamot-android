@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include "integer_common.h"
+#include "smmla_gemm.h"
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wcomment"
 #include "ruy/platform.h"
@@ -224,6 +225,19 @@ inline void transpose(const int8_t *input, Index rows, Index cols, int8_t *outpu
         seenGeneration = generation;
       }
 
+      // PATCH C: on CPUs with i8mm (Armv9 cores) the int8 GEMM runs the
+      // SMMLA kernel in smmla_gemm.cpp -- same integer math, bit-identical
+      // accumulators, measured 1.15-1.4x end to end on 8 Gen 1 / 8 Gen 3.
+      // Weights are prepacked per thread under the same generation guard as
+      // the ruy cache above. Other CPUs take the ruy path below unchanged;
+      // BERGAMOT_NO_I8MM=1 forces it everywhere (same-binary A/B, diagnostics).
+      if (smmla::available()) {
+        smmla::gemm8(input_A_prepared, input_B_prepared,
+                     reinterpret_cast<std::int32_t *>(output),
+                     static_cast<int>(rows_A), static_cast<int>(width),
+                     static_cast<int>(cols_B), cacheableB, generation);
+      } else {
+
       ruy::Matrix<std::int8_t> lhs;
       ruy::MakeSimpleLayout(rows_A, width, ruy::Order::kRowMajor, lhs.mutable_layout());
       lhs.set_data(input_A_prepared);
@@ -252,6 +266,8 @@ inline void transpose(const int8_t *input, Index rows, Index cols, int8_t *outpu
       // When Dst is int32, mul_params is unused.
       ruy::MulParams<std::int32_t, std::int32_t> mul_params;
       ruy::Mul(lhs, rhs, mul_params, &context, &dst);
+
+      }  // PATCH C: end of the ruy path
 
       // Unquantise:
       float32x4_t multiplier = vdupq_n_f32(unquant_multiplier);

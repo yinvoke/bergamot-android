@@ -1,0 +1,555 @@
+From 995088a5729bac31c95b1921d344f36563f2a272 Mon Sep 17 00:00:00 2001
+From: yinvoker <yinvoker@outlook.com>
+Date: Thu, 3 Sep 2026 16:01:45 +0800
+Subject: [PATCH] patch: SMMLA (Armv8.6 i8mm) int8 GEMM path, runtime-gated,
+ ruy fallback
+
+On CPUs that report HWCAP2_I8MM (Armv9 cores: Cortex-X2/X4, A710/A720,
+A510/A520) Multiply8Rui now runs an in-tree SMMLA kernel
+(tensors/cpu/smmla_gemm.cpp); every other CPU keeps the ruy SDOT path
+unchanged. Same integer math, so accumulators are bit-identical -- the
+canonical corpus hashes are unchanged on 8 Gen 3, 8 Gen 1, 865 and the
+M3 host, on both paths. BERGAMOT_NO_I8MM=1 forces the ruy path for
+same-binary A/B and diagnostics.
+
+Kernel: pair-interleaved packing (row/col pairs x 8-deep octets),
+8x8 tile with 16 register accumulators plus 4x8 / 2x8 tiles for
+decode-tail M and a guarded edge tile; weights prepacked per thread
+under the same generation guard as the ruy prepacked cache (0011);
+shortlist-selected B packed per call like ruy does. The TU alone is
+compiled with -march=armv8.2-a+dotprod+i8mm; the i8mm opcodes must
+stay confined to it (tools/smmla-test/check-opcodes.sh enforces).
+
+Measured (same binary, interleaved, same frequency caps): 8 Gen 3
+single sentence 1.35x, w2 1.23x, blocking 1.16x, pivot 1.15x;
+8 Gen 1 single sentence 1.37x, blocking 1.26x, pivot 1.27x, w2 1.23x;
+865 (no i8mm) fallback 3360 vs 3361 ms. Host M3 is -3..-5% (Apple cores
+issue sdot and smmla at the same rate) and is not the judge.
+
+Test set, hash regression and device list: tools/smmla-test,
+tools/regress-hash.sh, docs/smmla-compatibility.md.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ engine/marian-fork/src/CMakeLists.txt         |   8 +
+ .../src/tensors/cpu/ruy_interface.h           |  16 +
+ .../src/tensors/cpu/smmla_gemm.cpp            | 374 ++++++++++++++++++
+ .../marian-fork/src/tensors/cpu/smmla_gemm.h  |  58 +++
+ 4 files changed, 456 insertions(+)
+ create mode 100644 engine/marian-fork/src/tensors/cpu/smmla_gemm.cpp
+ create mode 100644 engine/marian-fork/src/tensors/cpu/smmla_gemm.h
+
+diff --git a/engine/marian-fork/src/CMakeLists.txt b/engine/marian-fork/src/CMakeLists.txt
+index b303d28..1bb51f1 100644
+--- a/engine/marian-fork/src/CMakeLists.txt
++++ b/engine/marian-fork/src/CMakeLists.txt
+@@ -59,6 +59,7 @@ set(MARIAN_SOURCES
+   tensors/cpu/tensor_operators.cpp
+   
+   tensors/cpu/integer_common.cpp
++  tensors/cpu/smmla_gemm.cpp
+   tensors/cpu/wasm_intgemm_fallback.cpp
+ 
+   graph/expression_graph.cpp
+@@ -128,6 +129,13 @@ if (NOT USE_WASM_COMPATIBLE_SOURCE)
+   endif(USE_FBGEMM)
+ endif()
+ 
++if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|armv8)")
++  # i8mm kernels live in one TU, runtime-gated on HWCAP2_I8MM; the raised
++  # -march must not leak into other TUs (baseline stays armv8-a for A55).
++  set_source_files_properties(tensors/cpu/smmla_gemm.cpp PROPERTIES
++    COMPILE_OPTIONS "-march=armv8.2-a+dotprod+i8mm")
++endif()
++
+ add_library(marian STATIC ${MARIAN_SOURCES})
+ 
+ target_compile_options(marian PRIVATE ${ALL_WARNINGS})
+diff --git a/engine/marian-fork/src/tensors/cpu/ruy_interface.h b/engine/marian-fork/src/tensors/cpu/ruy_interface.h
+index 0f03d0d..59d19b5 100644
+--- a/engine/marian-fork/src/tensors/cpu/ruy_interface.h
++++ b/engine/marian-fork/src/tensors/cpu/ruy_interface.h
+@@ -10,6 +10,7 @@
+ #include <cmath>
+ #include <cstdint>
+ #include "integer_common.h"
++#include "smmla_gemm.h"
+ #pragma GCC diagnostic push
+ #pragma GCC diagnostic ignored "-Wcomment"
+ #include "ruy/platform.h"
+@@ -224,6 +225,19 @@ inline void transpose(const int8_t *input, Index rows, Index cols, int8_t *outpu
+         seenGeneration = generation;
+       }
+ 
++      // PATCH C: on CPUs with i8mm (Armv9 cores) the int8 GEMM runs the
++      // SMMLA kernel in smmla_gemm.cpp -- same integer math, bit-identical
++      // accumulators, measured 1.15-1.4x end to end on 8 Gen 1 / 8 Gen 3.
++      // Weights are prepacked per thread under the same generation guard as
++      // the ruy cache above. Other CPUs take the ruy path below unchanged;
++      // BERGAMOT_NO_I8MM=1 forces it everywhere (same-binary A/B, diagnostics).
++      if (smmla::available()) {
++        smmla::gemm8(input_A_prepared, input_B_prepared,
++                     reinterpret_cast<std::int32_t *>(output),
++                     static_cast<int>(rows_A), static_cast<int>(width),
++                     static_cast<int>(cols_B), cacheableB, generation);
++      } else {
++
+       ruy::Matrix<std::int8_t> lhs;
+       ruy::MakeSimpleLayout(rows_A, width, ruy::Order::kRowMajor, lhs.mutable_layout());
+       lhs.set_data(input_A_prepared);
+@@ -253,6 +267,8 @@ inline void transpose(const int8_t *input, Index rows, Index cols, int8_t *outpu
+       ruy::MulParams<std::int32_t, std::int32_t> mul_params;
+       ruy::Mul(lhs, rhs, mul_params, &context, &dst);
+ 
++      }  // PATCH C: end of the ruy path
++
+       // Unquantise:
+       float32x4_t multiplier = vdupq_n_f32(unquant_multiplier);
+ 
+diff --git a/engine/marian-fork/src/tensors/cpu/smmla_gemm.cpp b/engine/marian-fork/src/tensors/cpu/smmla_gemm.cpp
+new file mode 100644
+index 0000000..c592499
+--- /dev/null
++++ b/engine/marian-fork/src/tensors/cpu/smmla_gemm.cpp
+@@ -0,0 +1,374 @@
++// SMMLA int8 GEMM. This TU is compiled with -march=...+i8mm (see
++// src/CMakeLists.txt); everything here runs only after smmla::available()
++// said yes, so no other TU may call the kernels directly. The i8mm opcodes
++// must stay confined to this TU's symbols -- tools/smmla-test/check-opcodes.sh
++// enforces that on the linked binary.
++#include "smmla_gemm.h"
++
++#if defined(__aarch64__)
++
++#include <arm_neon.h>
++
++#include <cstdlib>
++#include <cstring>
++#include <unordered_map>
++#include <vector>
++
++#if defined(__linux__)
++#include <sys/auxv.h>
++#ifndef AT_HWCAP2
++#define AT_HWCAP2 26
++#endif
++#ifndef HWCAP2_I8MM
++#define HWCAP2_I8MM (1UL << 13)
++#endif
++#elif defined(__APPLE__)
++#include <sys/sysctl.h>
++#endif
++
++namespace marian {
++namespace cpu {
++namespace integer {
++namespace smmla {
++
++bool available() {
++  static const bool ok = [] {
++    const char* kill = std::getenv("BERGAMOT_NO_I8MM");
++    if (kill && kill[0] == '1') return false;
++#if defined(__linux__)
++    return (getauxval(AT_HWCAP2) & HWCAP2_I8MM) != 0;
++#elif defined(__APPLE__)
++    int v = 0;
++    size_t sz = sizeof(v);
++    return sysctlbyname("hw.optional.arm.FEAT_I8MM", &v, &sz, nullptr, 0) == 0 && v == 1;
++#else
++    return false;
++#endif
++  }();
++  return ok;
++}
++
++// Packed operand layout, shared by A and B: pairs of K-strips interleaved in
++// 8-byte octets, zero-padded to pair count and to K8 = ceil(K/8) octets:
++//   packed[(pair * K8 + kt) * 16 + 0..7]  = strip(2*pair)  bytes [kt*8, kt*8+8)
++//   packed[(pair * K8 + kt) * 16 + 8..15] = strip(2*pair+1) bytes [kt*8, kt*8+8)
++// A strip = one row of A (row-major => K contiguous); B strip = one column of
++// B (col-major => K contiguous). Zero pad contributes zero to the dot. Every
++// byte of the output is written, so callers need not clear it.
++void packStrips(const int8_t* base,  // first strip
++                int strips,          // M (rows of A) or N (cols of B)
++                int K,
++                int8_t* out) {       // sized pairs*K8*16
++  const int K8 = (K + 7) / 8;
++  const int pairs = (strips + 1) / 2;
++  const int kTail = K - (K8 - 1) * 8;  // bytes of the last octet that exist
++  for (int p = 0; p < pairs; ++p) {
++    const int s0 = 2 * p, s1 = 2 * p + 1;
++    const int8_t* src0 = base + static_cast<size_t>(s0) * K;
++    const int8_t* src1 = s1 < strips ? base + static_cast<size_t>(s1) * K : nullptr;
++    int8_t* dst = out + static_cast<size_t>(p) * K8 * 16;
++    int kt = 0;
++    for (; kt < K8 - 1; ++kt, dst += 16) {
++      std::memcpy(dst, src0 + kt * 8, 8);
++      if (src1) std::memcpy(dst + 8, src1 + kt * 8, 8);
++      else std::memset(dst + 8, 0, 8);
++    }
++    // last octet, possibly partial
++    std::memset(dst, 0, 16);
++    std::memcpy(dst, src0 + kt * 8, kTail);
++    if (src1) std::memcpy(dst + 8, src1 + kt * 8, kTail);
++  }
++}
++
++namespace {
++
++// Full 8x8 tile: 16 named accumulators so they live in registers; the
++// generic variant below (spilled accumulator array) only runs edge tiles.
++inline void tile8x8Full(const int8_t* aPack,
++                        const int8_t* bPack,
++                        int K8,
++                        int32_t* C,
++                        int ldc) {
++  int32x4_t c00 = vdupq_n_s32(0), c01 = c00, c02 = c00, c03 = c00;
++  int32x4_t c10 = c00, c11 = c00, c12 = c00, c13 = c00;
++  int32x4_t c20 = c00, c21 = c00, c22 = c00, c23 = c00;
++  int32x4_t c30 = c00, c31 = c00, c32 = c00, c33 = c00;
++  const size_t stride = static_cast<size_t>(K8) * 16;
++  const int8_t* a0 = aPack;
++  const int8_t* a1 = aPack + stride;
++  const int8_t* a2 = aPack + 2 * stride;
++  const int8_t* a3 = aPack + 3 * stride;
++  const int8_t* b0 = bPack;
++  const int8_t* b1 = bPack + stride;
++  const int8_t* b2 = bPack + 2 * stride;
++  const int8_t* b3 = bPack + 3 * stride;
++  for (int kt = 0; kt < K8; ++kt) {
++    const int8x16_t va0 = vld1q_s8(a0 + kt * 16);
++    const int8x16_t va1 = vld1q_s8(a1 + kt * 16);
++    const int8x16_t va2 = vld1q_s8(a2 + kt * 16);
++    const int8x16_t va3 = vld1q_s8(a3 + kt * 16);
++    const int8x16_t vb0 = vld1q_s8(b0 + kt * 16);
++    const int8x16_t vb1 = vld1q_s8(b1 + kt * 16);
++    const int8x16_t vb2 = vld1q_s8(b2 + kt * 16);
++    const int8x16_t vb3 = vld1q_s8(b3 + kt * 16);
++    c00 = vmmlaq_s32(c00, va0, vb0);
++    c01 = vmmlaq_s32(c01, va0, vb1);
++    c02 = vmmlaq_s32(c02, va0, vb2);
++    c03 = vmmlaq_s32(c03, va0, vb3);
++    c10 = vmmlaq_s32(c10, va1, vb0);
++    c11 = vmmlaq_s32(c11, va1, vb1);
++    c12 = vmmlaq_s32(c12, va1, vb2);
++    c13 = vmmlaq_s32(c13, va1, vb3);
++    c20 = vmmlaq_s32(c20, va2, vb0);
++    c21 = vmmlaq_s32(c21, va2, vb1);
++    c22 = vmmlaq_s32(c22, va2, vb2);
++    c23 = vmmlaq_s32(c23, va2, vb3);
++    c30 = vmmlaq_s32(c30, va3, vb0);
++    c31 = vmmlaq_s32(c31, va3, vb1);
++    c32 = vmmlaq_s32(c32, va3, vb2);
++    c33 = vmmlaq_s32(c33, va3, vb3);
++  }
++  auto store2x2 = [&](int32x4_t v, int r, int c) {
++    vst1_s32(C + static_cast<size_t>(r) * ldc + c, vget_low_s32(v));
++    vst1_s32(C + static_cast<size_t>(r + 1) * ldc + c, vget_high_s32(v));
++  };
++  store2x2(c00, 0, 0); store2x2(c01, 0, 2); store2x2(c02, 0, 4); store2x2(c03, 0, 6);
++  store2x2(c10, 2, 0); store2x2(c11, 2, 2); store2x2(c12, 2, 4); store2x2(c13, 2, 6);
++  store2x2(c20, 4, 0); store2x2(c21, 4, 2); store2x2(c22, 4, 4); store2x2(c23, 4, 6);
++  store2x2(c30, 6, 0); store2x2(c31, 6, 2); store2x2(c32, 6, 4); store2x2(c33, 6, 6);
++}
++
++// Row-pair tile variants for small M: 1 row-pair (M<=2) and 2 row-pairs
++// (M<=4) across 4 col-pairs, so a decode-tail GEMM does not burn 8-row
++// padding. Full-width (cpCount==4) only; edges fall through to the generic
++// tile below.
++inline void tile2x8Full(const int8_t* aPack, const int8_t* bPack, int K8,
++                        int32_t* C, int ldc, int mLive) {
++  int32x4_t c0 = vdupq_n_s32(0), c1 = c0, c2 = c0, c3 = c0;
++  const size_t stride = static_cast<size_t>(K8) * 16;
++  for (int kt = 0; kt < K8; ++kt) {
++    const int8x16_t a = vld1q_s8(aPack + kt * 16);
++    c0 = vmmlaq_s32(c0, a, vld1q_s8(bPack + kt * 16));
++    c1 = vmmlaq_s32(c1, a, vld1q_s8(bPack + stride + kt * 16));
++    c2 = vmmlaq_s32(c2, a, vld1q_s8(bPack + 2 * stride + kt * 16));
++    c3 = vmmlaq_s32(c3, a, vld1q_s8(bPack + 3 * stride + kt * 16));
++  }
++  const int32x4_t acc[4] = {c0, c1, c2, c3};
++  for (int j = 0; j < 4; ++j) {
++    vst1_s32(C + 2 * j, vget_low_s32(acc[j]));
++    if (mLive > 1) vst1_s32(C + ldc + 2 * j, vget_high_s32(acc[j]));
++  }
++}
++
++inline void tile4x8Full(const int8_t* aPack, const int8_t* bPack, int K8,
++                        int32_t* C, int ldc, int mLive) {
++  int32x4_t c00 = vdupq_n_s32(0), c01 = c00, c02 = c00, c03 = c00;
++  int32x4_t c10 = c00, c11 = c00, c12 = c00, c13 = c00;
++  const size_t stride = static_cast<size_t>(K8) * 16;
++  const int8_t* a1 = aPack + stride;
++  for (int kt = 0; kt < K8; ++kt) {
++    const int8x16_t va0 = vld1q_s8(aPack + kt * 16);
++    const int8x16_t va1 = vld1q_s8(a1 + kt * 16);
++    const int8x16_t vb0 = vld1q_s8(bPack + kt * 16);
++    const int8x16_t vb1 = vld1q_s8(bPack + stride + kt * 16);
++    const int8x16_t vb2 = vld1q_s8(bPack + 2 * stride + kt * 16);
++    const int8x16_t vb3 = vld1q_s8(bPack + 3 * stride + kt * 16);
++    c00 = vmmlaq_s32(c00, va0, vb0);
++    c01 = vmmlaq_s32(c01, va0, vb1);
++    c02 = vmmlaq_s32(c02, va0, vb2);
++    c03 = vmmlaq_s32(c03, va0, vb3);
++    c10 = vmmlaq_s32(c10, va1, vb0);
++    c11 = vmmlaq_s32(c11, va1, vb1);
++    c12 = vmmlaq_s32(c12, va1, vb2);
++    c13 = vmmlaq_s32(c13, va1, vb3);
++  }
++  const int32x4_t r0[4] = {c00, c01, c02, c03};
++  const int32x4_t r1[4] = {c10, c11, c12, c13};
++  for (int j = 0; j < 4; ++j) {
++    vst1_s32(C + 2 * j, vget_low_s32(r0[j]));
++    vst1_s32(C + ldc + 2 * j, vget_high_s32(r0[j]));
++  }
++  if (mLive > 2) {
++    for (int j = 0; j < 4; ++j) {
++      vst1_s32(C + 2 * ldc + 2 * j, vget_low_s32(r1[j]));
++      if (mLive > 3) vst1_s32(C + 3 * ldc + 2 * j, vget_high_s32(r1[j]));
++    }
++  }
++}
++
++// Edge-tile variant: any rpCount/cpCount in [1,4], stores guarded by
++// mLive/nLive.
++inline void tile8x8(const int8_t* aPack,  // 4 row-pair strips base (rp stride K8*16)
++                    const int8_t* bPack,  // 4 col-pair strips base
++                    int rpCount,
++                    int cpCount,
++                    int K8,
++                    int32_t* C,
++                    int ldc,   // = N
++                    int mLive,  // rows to store (1..8)
++                    int nLive)  // cols to store (1..8)
++{
++  int32x4_t acc[4][4];
++  for (int i = 0; i < 4; ++i)
++    for (int j = 0; j < 4; ++j) acc[i][j] = vdupq_n_s32(0);
++
++  const size_t stride = static_cast<size_t>(K8) * 16;
++  for (int kt = 0; kt < K8; ++kt) {
++    int8x16_t a[4], b[4];
++    for (int i = 0; i < rpCount; ++i) a[i] = vld1q_s8(aPack + i * stride + kt * 16);
++    for (int j = 0; j < cpCount; ++j) b[j] = vld1q_s8(bPack + j * stride + kt * 16);
++    for (int i = 0; i < rpCount; ++i)
++      for (int j = 0; j < cpCount; ++j) acc[i][j] = vmmlaq_s32(acc[i][j], a[i], b[j]);
++  }
++
++  // acc[i][j] lanes = [C(2i,2j), C(2i,2j+1), C(2i+1,2j), C(2i+1,2j+1)]
++  for (int i = 0; i < rpCount; ++i) {
++    for (int j = 0; j < cpCount; ++j) {
++      const int r0 = 2 * i, c0 = 2 * j;
++      const int32x4_t v = acc[i][j];
++      if (r0 + 1 < mLive && c0 + 1 < nLive) {
++        vst1_s32(C + static_cast<size_t>(r0) * ldc + c0, vget_low_s32(v));
++        vst1_s32(C + static_cast<size_t>(r0 + 1) * ldc + c0, vget_high_s32(v));
++      } else {
++        int32_t lanes[4];
++        vst1q_s32(lanes, v);
++        if (r0 < mLive && c0 < nLive) C[static_cast<size_t>(r0) * ldc + c0] = lanes[0];
++        if (r0 < mLive && c0 + 1 < nLive) C[static_cast<size_t>(r0) * ldc + c0 + 1] = lanes[1];
++        if (r0 + 1 < mLive && c0 < nLive) C[static_cast<size_t>(r0 + 1) * ldc + c0] = lanes[2];
++        if (r0 + 1 < mLive && c0 + 1 < nLive) C[static_cast<size_t>(r0 + 1) * ldc + c0 + 1] = lanes[3];
++      }
++    }
++  }
++}
++
++struct PackedB {
++  std::vector<int8_t> data;
++  int K = 0;
++  int N = 0;
++  uint64_t generation = 0;
++};
++
++// Per-thread caches, mirroring the ruy prepacked-cache lifetime rules from
++// patch 0011: keyed by the weight data pointer, dropped whenever the model
++// generation counter moves (model unload can hand a new model the same
++// addresses).
++thread_local std::unordered_map<const void*, PackedB> bCache;
++thread_local std::vector<int8_t> aScratch;
++thread_local std::vector<int8_t> bScratch;
++thread_local uint64_t seenGeneration = 0;
++thread_local testing::TileCounters tileCounts;
++
++}  // namespace
++
++namespace testing {
++size_t packedBytes(int strips, int K) {
++  return static_cast<size_t>((strips + 1) / 2) * static_cast<size_t>((K + 7) / 8) * 16;
++}
++void packStrips(const int8_t* base, int strips, int K, int8_t* out) {
++  ::marian::cpu::integer::smmla::packStrips(base, strips, K, out);
++}
++TileCounters tileCounters() { return tileCounts; }
++void resetTileCounters() { tileCounts = TileCounters{}; }
++}  // namespace testing
++
++void gemm8(const int8_t* A,
++           const int8_t* B,
++           int32_t* C,
++           int M,
++           int K,
++           int N,
++           bool cacheableB,
++           uint64_t generation) {
++  const int K8 = (K + 7) / 8;
++  const int mPairs = (M + 1) / 2;
++  const int nPairs = (N + 1) / 2;
++  const size_t stripBytes = static_cast<size_t>(K8) * 16;
++
++  if (generation != seenGeneration) {
++    bCache.clear();
++    seenGeneration = generation;
++  }
++
++  // packStrips writes every byte of its output (zero pads included), so the
++  // scratch buffers only ever grow; no per-call clearing.
++  auto ensure = [](std::vector<int8_t>& v, size_t n) { if (v.size() < n) v.resize(n); };
++
++  const int8_t* bPacked;
++  if (cacheableB) {
++    PackedB& e = bCache[B];
++    if (e.K != K || e.N != N || e.generation != generation) {
++      e.data.resize(static_cast<size_t>(nPairs) * stripBytes);
++      packStrips(B, N, K, e.data.data());
++      e.K = K;
++      e.N = N;
++      e.generation = generation;
++    }
++    bPacked = e.data.data();
++  } else {
++    ensure(bScratch, static_cast<size_t>(nPairs) * stripBytes);
++    packStrips(B, N, K, bScratch.data());
++    bPacked = bScratch.data();
++  }
++
++  ensure(aScratch, static_cast<size_t>(mPairs) * stripBytes);
++  packStrips(A, M, K, aScratch.data());
++
++  for (int rp = 0; rp < mPairs; rp += 4) {
++    const int rpCount = mPairs - rp < 4 ? mPairs - rp : 4;
++    const int r0 = 2 * rp;
++    const int mLive = M - r0 < 8 ? M - r0 : 8;
++    for (int cp = 0; cp < nPairs; cp += 4) {
++      const int cpCount = nPairs - cp < 4 ? nPairs - cp : 4;
++      const int c0 = 2 * cp;
++      const int nLive = N - c0 < 8 ? N - c0 : 8;
++      if (rpCount == 4 && cpCount == 4 && mLive == 8 && nLive == 8) {
++        ++tileCounts.full8x8;
++        tile8x8Full(aScratch.data() + static_cast<size_t>(rp) * stripBytes,
++                    bPacked + static_cast<size_t>(cp) * stripBytes,
++                    K8, C + static_cast<size_t>(r0) * N + c0, N);
++      } else if (rpCount == 1 && cpCount == 4 && nLive == 8) {
++        ++tileCounts.tile2x8;
++        tile2x8Full(aScratch.data() + static_cast<size_t>(rp) * stripBytes,
++                    bPacked + static_cast<size_t>(cp) * stripBytes,
++                    K8, C + static_cast<size_t>(r0) * N + c0, N, mLive);
++      } else if (rpCount == 2 && cpCount == 4 && nLive == 8) {
++        ++tileCounts.tile4x8;
++        tile4x8Full(aScratch.data() + static_cast<size_t>(rp) * stripBytes,
++                    bPacked + static_cast<size_t>(cp) * stripBytes,
++                    K8, C + static_cast<size_t>(r0) * N + c0, N, mLive);
++      } else {
++        ++tileCounts.edge;
++        tile8x8(aScratch.data() + static_cast<size_t>(rp) * stripBytes,
++                bPacked + static_cast<size_t>(cp) * stripBytes,
++                rpCount, cpCount, K8,
++                C + static_cast<size_t>(r0) * N + c0, N, mLive, nLive);
++      }
++    }
++  }
++}
++
++}  // namespace smmla
++}  // namespace integer
++}  // namespace cpu
++}  // namespace marian
++
++#else  // !__aarch64__
++
++namespace marian {
++namespace cpu {
++namespace integer {
++namespace smmla {
++bool available() { return false; }
++void gemm8(const int8_t*, const int8_t*, int32_t*, int, int, int, bool, uint64_t) {}
++namespace testing {
++size_t packedBytes(int, int) { return 0; }
++void packStrips(const int8_t*, int, int, int8_t*) {}
++TileCounters tileCounters() { return TileCounters{}; }
++void resetTileCounters() {}
++}  // namespace testing
++}  // namespace smmla
++}  // namespace integer
++}  // namespace cpu
++}  // namespace marian
++
++#endif
+diff --git a/engine/marian-fork/src/tensors/cpu/smmla_gemm.h b/engine/marian-fork/src/tensors/cpu/smmla_gemm.h
+new file mode 100644
+index 0000000..ac63efe
+--- /dev/null
++++ b/engine/marian-fork/src/tensors/cpu/smmla_gemm.h
+@@ -0,0 +1,58 @@
++#pragma once
++// SMMLA (Armv8.6 i8mm) int8 GEMM: the int8 matmul path Multiply8Rui takes
++// on CPUs that have i8mm (Armv9 cores such as Cortex-X2/X4, A710/A720);
++// everything else keeps the ruy SDOT path. Layout contract mirrors that call
++// site exactly:
++//   A: row-major M x K int8 (quantized activations)
++//   B: col-major K x N int8 (N strips of K contiguous bytes; model weights or
++//      shortlist-selected columns)
++//   C: row-major M x N int32 (raw accumulators; caller unquantizes in place)
++// Same integer math as ruy => results are bit-identical (verified on 8 Gen 3,
++// 8 Gen 1 and 865 against the same canonical corpus hashes); the engine hash
++// regression (tools/regress-hash.sh) and tools/smmla-test are the gates.
++// Runtime-gated on HWCAP2_I8MM (macOS: the FEAT_I8MM sysctl);
++// BERGAMOT_NO_I8MM=1 forces the ruy path (same-binary A/B, diagnostics).
++// Tested SoCs/devices: docs/smmla-compatibility.md.
++#include <cstddef>
++#include <cstdint>
++
++namespace marian {
++namespace cpu {
++namespace integer {
++namespace smmla {
++
++// True when the CPU has i8mm and the kill switch is not set. Cheap after the
++// first call.
++bool available();
++
++// C = A * B. cacheableB marks constant model weights: their SMMLA-layout pack
++// is cached per thread and invalidated when `generation` changes (same
++// counter the ruy prepacked cache uses). Non-cacheable B is packed per call.
++void gemm8(const int8_t* A,
++           const int8_t* B,
++           int32_t* C,
++           int M,
++           int K,
++           int N,
++           bool cacheableB,
++           uint64_t generation);
++
++// Test hooks -- not part of the engine contract. They let the test set check
++// the packer on its own (guard-paged output, byte compare against an
++// independent reference) and assert that every tile variant actually ran.
++namespace testing {
++// Bytes packStrips() writes for `strips` K-strips: pairs * ceil(K/8) * 16.
++size_t packedBytes(int strips, int K);
++// Pair-interleaved packing of A rows or B columns (both are K-contiguous).
++void packStrips(const int8_t* base, int strips, int K, int8_t* out);
++struct TileCounters {
++  uint64_t full8x8 = 0, tile4x8 = 0, tile2x8 = 0, edge = 0;
++};
++TileCounters tileCounters();  // this thread's counts since resetTileCounters()
++void resetTileCounters();
++}  // namespace testing
++
++}  // namespace smmla
++}  // namespace integer
++}  // namespace cpu
++}  // namespace marian
+-- 
+2.54.0
+
