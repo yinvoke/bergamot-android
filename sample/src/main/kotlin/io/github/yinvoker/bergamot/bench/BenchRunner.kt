@@ -18,7 +18,7 @@ import org.json.JSONObject
 
 /**
  * One-tap benchmark: ML Kit vs Bergamot on the same fixed test set
- * (FLORES-200 devtest, first 150 sentences), en->zh and ja->zh.
+ * (FLORES-200 devtest, first 200 sentences), en->zh and ja->zh.
  * Emits bench_result_<threads>t.json into the app's files dirs (external +
  * internal mirror) for host-side scoring (COMET) and curve plotting.
  */

@@ -99,7 +99,7 @@ class MainActivity : Activity() {
         }
         val hint = TextView(this).apply {
             textSize = 12f
-            text = "FLORES-150 · en→zh + ja→zh(pivot/seq)· 每次 RUN 使用全新进程(引擎全局态限制)\n结果自动存档,跑完立刻显示耗时/速度与 CPU、内存曲线"
+            text = "FLORES-200 · en→zh + ja→zh(pivot/seq)· 每次 RUN 使用全新进程(引擎全局态限制)\n结果自动存档,跑完立刻显示耗时/速度与 CPU、内存曲线"
         }
         col.addView(radios)
         col.addView(buttons)

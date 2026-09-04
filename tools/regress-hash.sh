@@ -13,13 +13,24 @@ smoke=${1:?smoke}; enzh=${2:?enzh config}; eng=${3:?eng.txt}
 jaen=${4:-}; jpn=${5:-}
 platform=${PLATFORM:-host}
 
-# Canonical blocking hashes (FNV-1a over the corpus output), by platform and
-# config: host runs the mbw1024 CI config, devices run the mbw512 default.
-case "$platform" in
-  host)   expect_enzh=${EXPECT_ENZH:-1728c7c863926c5c}; expect_pivot=${EXPECT_PIVOT:-58b6667dd43d6364} ;;
-  device) expect_enzh=${EXPECT_ENZH:-1742b57a069b1da7}; expect_pivot=${EXPECT_PIVOT:-28028fc1ed7d0099} ;;
+# Canonical blocking hashes (FNV-1a over the corpus output) by platform, config
+# and corpus size: host runs the mbw1024 CI config, devices run the mbw512
+# default. The hash covers the whole corpus and batch composition changes the
+# output of individual sentences, so each corpus size has its own table entry
+# (bench set grew from FLORES lines 1-150 to 1-200 on 2026-09-04).
+n=$(wc -l < "$eng" | tr -d ' ')
+case "$platform/$n" in
+  host/150)   can_enzh=1728c7c863926c5c; can_pivot=58b6667dd43d6364 ;;
+  host/200)   can_enzh=3b458f7f7fe6fd68; can_pivot=00602a479d7c106b ;;
+  device/150) can_enzh=1742b57a069b1da7; can_pivot=28028fc1ed7d0099 ;;
+  device/200) can_enzh=; can_pivot= ;;   # not baselined yet: run once, then fill in
+  host/*|device/*) can_enzh=; can_pivot= ;;
   *) echo "unknown PLATFORM=$platform"; exit 2 ;;
 esac
+expect_enzh=${EXPECT_ENZH:-$can_enzh}; expect_pivot=${EXPECT_PIVOT:-$can_pivot}
+if [ -z "$expect_enzh" ] || { [ -n "$jaen" ] && [ -z "$expect_pivot" ]; }; then
+  echo "no canonical hash for $platform with a $n-line corpus; pass EXPECT_ENZH / EXPECT_PIVOT"; exit 2
+fi
 
 tmp=$(mktemp -d)
 run() { # $1 env-prefix  $2 dump-prefix  $3.. configs
