@@ -1,0 +1,53 @@
+From b0e2b2839260d73cdf3b5afa0900abb331137fd8 Mon Sep 17 00:00:00 2001
+From: yinvoker <yinvoker@outlook.com>
+Date: Tue, 1 Sep 2026 11:52:40 +0800
+Subject: [PATCH] patch: order RequestSentences by request id, not by heap
+ address
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+RequestSentence::operator< compared the Ptr<Request> smart pointers when
+the sentences belong to different requests, so the batching pool's
+std::set ordered same-length sentences by allocator addresses. Batch
+membership then varied run to run (and pass to pass), which changed each
+batch's shortlist union and with it the logits — the source of the
+pass-level nondeterminism seen in the perf experiments (0-3 flipped
+sentences per 150 with shortlist on; fully stable with shortlist off,
+where the row-independent full-vocab output makes membership invisible).
+
+Dereference and compare the Requests themselves: Request::operator<
+orders by the service's monotonic sequence id, i.e. arrival order.
+
+Verified on host (en-zh, FLORES-150, shortlist on): 5 passes x 3
+processes (incl. MallocPreScribble) hash-identical for blocking; 5
+passes x 2 runs identical for 2 and 4 workers; the stable output is one
+of the variants the unfixed code already produced, and timing is
+unchanged. Upstream mozilla/translations main carries the same
+comparator.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ engine/src/translator/request.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/engine/src/translator/request.cpp b/engine/src/translator/request.cpp
+index fd8fe8f..729bf86 100644
+--- a/engine/src/translator/request.cpp
++++ b/engine/src/translator/request.cpp
+@@ -112,7 +112,11 @@ bool operator<(const RequestSentence &a, const RequestSentence &b) {
+   if (a.request_ == b.request_) {
+     return a.index_ < b.index_;
+   }
+-  return a.request_ < b.request_;
++  // Compare the Requests (by sequence id), not the smart pointers: ordering by
++  // heap address made the batching pool's std::set traversal - and therefore
++  // batch membership, the per-batch shortlist union and ultimately the
++  // translations - depend on allocator state, varying run to run.
++  return *a.request_ < *b.request_;
+ }
+ 
+ // ----------------------------------------------------------------------
+-- 
+2.54.0
+

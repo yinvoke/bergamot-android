@@ -112,7 +112,11 @@ bool operator<(const RequestSentence &a, const RequestSentence &b) {
   if (a.request_ == b.request_) {
     return a.index_ < b.index_;
   }
-  return a.request_ < b.request_;
+  // Compare the Requests (by sequence id), not the smart pointers: ordering by
+  // heap address made the batching pool's std::set traversal - and therefore
+  // batch membership, the per-batch shortlist union and ultimately the
+  // translations - depend on allocator state, varying run to run.
+  return *a.request_ < *b.request_;
 }
 
 // ----------------------------------------------------------------------
