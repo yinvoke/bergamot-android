@@ -1,0 +1,1007 @@
+From 1e38512c0b5c34803f47c01b61ac03a0ecdf4ea0 Mon Sep 17 00:00:00 2001
+From: yinvoker <yinvoker@outlook.com>
+Date: Sat, 5 Sep 2026 21:27:45 +0800
+Subject: [PATCH] =?UTF-8?q?perf:=20close=20the=20model=20release=20loop=20?=
+ =?UTF-8?q?=E2=80=94=20worker,=20aggregate=20queue=20and=20per-thread=20pa?=
+ =?UTF-8?q?cking=20caches=20let=20go=20on=20AsyncService::release()=20(pat?=
+ =?UTF-8?q?ch=200021)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ engine/marian-fork/src/CMakeLists.txt         |  1 +
+ engine/marian-fork/src/common/lifecycle.cpp   | 76 ++++++++++++++++
+ engine/marian-fork/src/common/lifecycle.h     | 56 ++++++++++++
+ .../src/graph/expression_graph.cpp            | 17 +++-
+ .../marian-fork/src/graph/expression_graph.h  |  7 +-
+ .../src/tensors/cpu/integer_common.cpp        | 21 +++++
+ .../src/tensors/cpu/integer_common.h          | 11 +++
+ .../src/tensors/cpu/ruy_interface.h           | 80 +++++++++++++++--
+ .../src/tensors/cpu/smmla_gemm.cpp            | 62 +++++++++++++
+ .../marian-fork/src/tensors/cpu/smmla_gemm.h  |  6 ++
+ engine/src/translator/service.cpp             | 90 ++++++++++++++++++-
+ engine/src/translator/service.h               | 30 +++++++
+ .../translator/threadsafe_batching_pool.cpp   | 51 ++++++++++-
+ .../src/translator/threadsafe_batching_pool.h | 47 +++++++++-
+ engine/src/translator/translation_model.cpp   | 56 +++++++++++-
+ engine/src/translator/translation_model.h     |  4 +
+ 16 files changed, 593 insertions(+), 22 deletions(-)
+ create mode 100644 engine/marian-fork/src/common/lifecycle.cpp
+ create mode 100644 engine/marian-fork/src/common/lifecycle.h
+
+diff --git a/engine/marian-fork/src/CMakeLists.txt b/engine/marian-fork/src/CMakeLists.txt
+index d6200b3..5e6ce5b 100644
+--- a/engine/marian-fork/src/CMakeLists.txt
++++ b/engine/marian-fork/src/CMakeLists.txt
+@@ -18,6 +18,7 @@ set(MARIAN_SOURCES
+   common/version.cpp
+   common/utils.cpp
+   common/logging.cpp
++  common/lifecycle.cpp
+   common/cli_helper.cpp
+   common/cli_wrapper.cpp
+   common/config.cpp
+diff --git a/engine/marian-fork/src/common/lifecycle.cpp b/engine/marian-fork/src/common/lifecycle.cpp
+new file mode 100644
+index 0000000..bbb9fdf
+--- /dev/null
++++ b/engine/marian-fork/src/common/lifecycle.cpp
+@@ -0,0 +1,76 @@
++#include "common/lifecycle.h"
++
++#include <chrono>
++#include <cstdarg>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++#ifdef __ANDROID__
++#include <android/log.h>
++#endif
++
++namespace marian {
++namespace lifecycle {
++
++namespace {
++
++bool readEnv() {
++  const char *value = std::getenv("BERGAMOT_LIFECYCLE");
++  return value != nullptr && std::strcmp(value, "1") == 0;
++}
++
++std::chrono::steady_clock::time_point &epoch() {
++  static std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++  return start;
++}
++
++}  // namespace
++
++std::atomic<bool> gEnabled{readEnv()};
++
++double nowMs() {
++  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - epoch()).count();
++}
++
++void event(const char *fmt, ...) {
++  if (!enabled()) return;
++  char body[512];
++  va_list args;
++  va_start(args, fmt);
++  vsnprintf(body, sizeof(body), fmt, args);
++  va_end(args);
++  // One fprintf so concurrent workers cannot interleave inside a line.
++  std::fprintf(stderr, "[lifecycle t=%.3f] %s\n", nowMs(), body);
++#ifdef __ANDROID__
++  __android_log_print(ANDROID_LOG_INFO, "bergamot-lifecycle", "t=%.3f %s", nowMs(), body);
++#endif
++}
++
++std::atomic<long> &liveModels() {
++  static std::atomic<long> counter{0};
++  return counter;
++}
++
++std::atomic<long> &liveGraphs() {
++  static std::atomic<long> counter{0};
++  return counter;
++}
++
++std::atomic<long long> &ruyPrepackedBytes() {
++  static std::atomic<long long> counter{0};
++  return counter;
++}
++
++std::atomic<long long> &smmlaPackedBytes() {
++  static std::atomic<long long> counter{0};
++  return counter;
++}
++
++std::atomic<long long> &smmlaScratchBytes() {
++  static std::atomic<long long> counter{0};
++  return counter;
++}
++
++}  // namespace lifecycle
++}  // namespace marian
+diff --git a/engine/marian-fork/src/common/lifecycle.h b/engine/marian-fork/src/common/lifecycle.h
+new file mode 100644
+index 0000000..a3967ba
+--- /dev/null
++++ b/engine/marian-fork/src/common/lifecycle.h
+@@ -0,0 +1,56 @@
++#pragma once
++// D0: opt-in lifecycle tracing for model / graph / GEMM-packing-cache teardown.
++//
++// Everything here is inert unless BERGAMOT_LIFECYCLE=1 is set in the
++// environment before the process starts. The cost on a hot path is then
++// exactly one relaxed atomic load (`lifecycle::enabled()`), which is why the
++// flag is a plain extern atomic read inline here rather than a function-local
++// static behind a guard variable.
++//
++// The live-object counters are the exception: they are maintained
++// unconditionally (one relaxed fetch_add per TranslationModel /
++// ExpressionGraph construction and destruction, i.e. a handful of times per
++// process) so a harness or a test can assert "the destructor actually ran"
++// without turning tracing on.
++#include <atomic>
++#include <cstdint>
++
++namespace marian {
++namespace lifecycle {
++
++/// Set once during static initialisation from BERGAMOT_LIFECYCLE. Read it
++/// through enabled(); it is public only so that read can stay inline.
++extern std::atomic<bool> gEnabled;
++
++/// One relaxed load. False until this translation unit's dynamic initialiser
++/// has run, so events raised from other translation units' static
++/// initialisers are silently dropped -- there are none today.
++inline bool enabled() { return gEnabled.load(std::memory_order_relaxed); }
++
++/// Milliseconds on a steady clock, zeroed on the first call in the process.
++double nowMs();
++
++/// printf-style event line, prefixed with "[lifecycle t=<ms>] ", to stderr and
++/// (on Android) to logcat. No-op when disabled; callers may still guard with
++/// enabled() to skip argument evaluation.
++void event(const char *fmt, ...)
++#if defined(__GNUC__)
++    __attribute__((format(printf, 1, 2)))
++#endif
++    ;
++
++/// Live TranslationModel / ExpressionGraph objects. Always maintained.
++std::atomic<long> &liveModels();
++std::atomic<long> &liveGraphs();
++
++/// Bytes currently retained by the per-thread GEMM packing caches, summed over
++/// every thread that has one. Only maintained while enabled() -- the ruy
++/// figure needs a cache-size read per GEMM, which we do not want in a
++/// production build. Reading these from another thread is a benign race by
++/// construction: each is a single atomic.
++std::atomic<long long> &ruyPrepackedBytes();   ///< ruy::Context PrepackedCache
++std::atomic<long long> &smmlaPackedBytes();    ///< smmla bCache PackedB payloads
++std::atomic<long long> &smmlaScratchBytes();   ///< smmla aScratch + bScratch
++
++}  // namespace lifecycle
++}  // namespace marian
+diff --git a/engine/marian-fork/src/graph/expression_graph.cpp b/engine/marian-fork/src/graph/expression_graph.cpp
+index 7d42e81..a3c1bac 100644
+--- a/engine/marian-fork/src/graph/expression_graph.cpp
++++ b/engine/marian-fork/src/graph/expression_graph.cpp
+@@ -1,4 +1,5 @@
+ #include "graph/expression_graph.h"
++#include "common/lifecycle.h"  // D0: graph lifetime counter
+ #include "tensors/tensor_operators.h"
+ 
+ #include <sstream>
+@@ -7,7 +8,21 @@ namespace marian {
+ 
+ ExpressionGraph::ExpressionGraph(bool inference)
+   : inferenceOnly_(inference),
+-    backend_(nullptr) {}
++    backend_(nullptr) {
++  lifecycle::liveGraphs().fetch_add(1, std::memory_order_relaxed);
++}
++
++// D0: out-of-line so the counter lives next to the constructor's. The body is
++// what the header used to hold inline.
++ExpressionGraph::~ExpressionGraph() {
++  clear();
++  for(auto kvParams : paramsByElementType_)
++    kvParams.second->clear();
++  lifecycle::liveGraphs().fetch_sub(1, std::memory_order_relaxed);
++  if(lifecycle::enabled())
++    lifecycle::event("graph_dtor live_graphs=%ld",
++                     lifecycle::liveGraphs().load(std::memory_order_relaxed));
++}
+ 
+ void ExpressionGraph::setDevice(DeviceId deviceId, Ptr<Device> device) {
+   if(!backend_) {
+diff --git a/engine/marian-fork/src/graph/expression_graph.h b/engine/marian-fork/src/graph/expression_graph.h
+index 305f639..6b1dd6f 100644
+--- a/engine/marian-fork/src/graph/expression_graph.h
++++ b/engine/marian-fork/src/graph/expression_graph.h
+@@ -176,11 +176,8 @@ public:
+    */
+   ExpressionGraph(bool inference = false);
+ 
+-  virtual ~ExpressionGraph() {
+-    clear();
+-    for(auto kvParams : paramsByElementType_)
+-      kvParams.second->clear();
+-  }
++  // D0: defined in expression_graph.cpp so it can keep the live-graph counter.
++  virtual ~ExpressionGraph();
+ 
+   virtual void setDevice(DeviceId deviceId = {0, DeviceType::gpu},
+                          Ptr<Device> device = nullptr);
+diff --git a/engine/marian-fork/src/tensors/cpu/integer_common.cpp b/engine/marian-fork/src/tensors/cpu/integer_common.cpp
+index 6169c95..29e24ff 100644
+--- a/engine/marian-fork/src/tensors/cpu/integer_common.cpp
++++ b/engine/marian-fork/src/tensors/cpu/integer_common.cpp
+@@ -1,5 +1,14 @@
+ #include "integer_common.h"
+ 
++// D0: releaseThreadPackingCaches() needs the per-thread cache owners. Both are
++// architecture-gated exactly as their GEMM paths are.
++#if defined(ARM)
++#include "ruy_interface.h"
++#endif
++#if defined(__aarch64__)
++#include "smmla_gemm.h"
++#endif
++
+ #ifdef __SSE__
+ #include <emmintrin.h>
+ #include <immintrin.h>
+@@ -24,6 +33,18 @@ void bumpPrepackGeneration() {
+   prepackGeneration().fetch_add(1, std::memory_order_relaxed);
+ }
+ 
++// D0: see integer_common.h. Both caches are per-thread, so this only ever
++// touches the calling thread's state -- no locking needed, and no ordering
++// against other threads' GEMMs.
++void releaseThreadPackingCaches() {
++#if defined(ARM)
++  releaseThreadRuyCache();
++#endif
++#if defined(__aarch64__)
++  smmla::releaseThreadCaches();
++#endif
++}
++
+ // This operates on floats after processing so doesn't care about int8_t vs int16_t.
+ void AddBias(marian::Tensor C, const marian::Tensor Bias) {
+   float* y = C->data();
+diff --git a/engine/marian-fork/src/tensors/cpu/integer_common.h b/engine/marian-fork/src/tensors/cpu/integer_common.h
+index 9122791..c32c31e 100644
+--- a/engine/marian-fork/src/tensors/cpu/integer_common.h
++++ b/engine/marian-fork/src/tensors/cpu/integer_common.h
+@@ -44,6 +44,17 @@ namespace integer {
+ std::atomic<uint64_t> &prepackGeneration();
+ void bumpPrepackGeneration();
+ 
++// D0: drop THIS thread's GEMM weight-packing caches -- ruy's prepacked cache
++// and, on i8mm CPUs, the SMMLA packed-B cache and scratch buffers. They are
++// thread_local, so a model teardown on another thread cannot free them; the
++// generation guard above only reclaims them lazily, at the next GEMM this
++// thread happens to run, which never comes if translation has stopped. The
++// service's release path calls this on every worker.
++//
++// Correctness-neutral: the next GEMM on this thread re-packs from the model's
++// own weights. Only affects the calling thread.
++void releaseThreadPackingCaches();
++
+ // Making sure we have access to common functions for RUY and INTGEMM
+ class fetchAlphaFromModelNodeOp : public UnaryNodeOp {
+ public:
+diff --git a/engine/marian-fork/src/tensors/cpu/ruy_interface.h b/engine/marian-fork/src/tensors/cpu/ruy_interface.h
+index 8922b3f..f9966f1 100644
+--- a/engine/marian-fork/src/tensors/cpu/ruy_interface.h
++++ b/engine/marian-fork/src/tensors/cpu/ruy_interface.h
+@@ -9,11 +9,16 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdint>
++#include "common/lifecycle.h"  // D0: prepacked-cache tracing
+ #include "integer_common.h"
+ #include "smmla_gemm.h"
+ #pragma GCC diagnostic push
+ #pragma GCC diagnostic ignored "-Wcomment"
++#include "ruy/context.h"
++#include "ruy/context_get_ctx.h"
++#include "ruy/ctx.h"
+ #include "ruy/platform.h"
++#include "ruy/prepacked_cache.h"
+ #include "ruy/system_aligned_alloc.h"
+ #pragma GCC diagnostic pop
+ 
+@@ -27,6 +32,45 @@ namespace integer {
+ 
+ using Index = unsigned int;
+ 
++/// PATCH A / D0: everything the int8 ruy GEMM keeps per thread. A Context owns
++/// a thread pool, allocators and the prepacked-weight cache; rebuilding it per
++/// matmul is pure overhead, and Context is not thread-safe, so thread_local is
++/// the matching lifetime -- it maps 1:1 onto the AsyncService worker model.
++/// Hoisted into a named accessor (D0) so an explicit release can clear the
++/// cache from outside the GEMM. `inline` gives one instance per thread across
++/// all translation units.
++struct RuyThreadState {
++  ruy::Context context;
++  uint64_t seenGeneration = 0;
++  /// This thread's share of lifecycle::ruyPrepackedBytes(). Subtracted here so
++  /// the process-wide total drops when a worker thread exits.
++  long long accountedPrepackedBytes = 0;
++  ~RuyThreadState() {
++    if (accountedPrepackedBytes != 0)
++      lifecycle::ruyPrepackedBytes().fetch_sub(accountedPrepackedBytes, std::memory_order_relaxed);
++  }
++};
++
++inline RuyThreadState &threadRuyState() {
++  static thread_local RuyThreadState state;
++  return state;
++}
++
++/// D0: drop THIS thread's ruy prepacked-weight cache. Only affects the calling
++/// thread; the next GEMM re-packs, so this is a memory/latency trade only.
++inline void releaseThreadRuyCache() {
++  RuyThreadState &state = threadRuyState();
++  state.context.ClearPrepackedCache();
++  if (state.accountedPrepackedBytes != 0) {
++    lifecycle::event("ruy_prepack_released bytes=%lld", state.accountedPrepackedBytes);
++    lifecycle::ruyPrepackedBytes().fetch_sub(state.accountedPrepackedBytes, std::memory_order_relaxed);
++    state.accountedPrepackedBytes = 0;
++  }
++  // We just cleared, so adopt the current generation: no point clearing an
++  // empty cache again on the next GEMM.
++  state.seenGeneration = prepackGeneration().load(std::memory_order_relaxed);
++}
++
+ #if RUY_PLATFORM_NEON
+ 
+ /*
+@@ -207,22 +251,28 @@ inline void transpose(const int8_t *input, Index rows, Index cols, int8_t *outpu
+       // The following is adapted from
+       // https://github.com/google/ruy/blob/878283640de7946a43053e8ebf4f15114fbc9156/example/example.cc#L129-L152
+ 
+-      // PATCH A: one ruy::Context per thread instead of one per GEMM call.
+-      // A Context owns a thread pool, allocators and the prepacked cache;
+-      // rebuilding it on every matmul is pure overhead. Context is not
+-      // thread-safe, so thread_local is the matching lifetime -- it maps 1:1
+-      // onto the AsyncService worker model (same approach CTranslate2 takes).
+-      static thread_local ruy::Context context;
++      // PATCH A / D0: the one ruy::Context per thread (see threadRuyState()).
++      RuyThreadState &state = threadRuyState();
++      ruy::Context &context = state.context;
++      long long &accountedPrepackedBytes = state.accountedPrepackedBytes;
+ 
+       // PATCH B: drop this thread's prepacked weights when any model has been
+       // torn down since we last packed. Cheap: one relaxed atomic load per
+       // GEMM, and the clear only ever runs on the generation change.
+-      static thread_local uint64_t seenGeneration = 0;
+       const uint64_t generation =
+           prepackGeneration().load(std::memory_order_relaxed);
+-      if (generation != seenGeneration) {
++      if (generation != state.seenGeneration) {
+         context.ClearPrepackedCache();
+-        seenGeneration = generation;
++        if (lifecycle::enabled()) {
++          lifecycle::event("ruy_prepack_cleared bytes=%lld generation=%llu->%llu",
++                           accountedPrepackedBytes,
++                           static_cast<unsigned long long>(state.seenGeneration),
++                           static_cast<unsigned long long>(generation));
++          lifecycle::ruyPrepackedBytes().fetch_sub(accountedPrepackedBytes,
++                                                   std::memory_order_relaxed);
++          accountedPrepackedBytes = 0;
++        }
++        state.seenGeneration = generation;
+       }
+ 
+       // PATCH C: on CPUs with i8mm (Armv9 cores) the int8 GEMM runs the
+@@ -267,6 +317,18 @@ inline void transpose(const int8_t *input, Index rows, Index cols, int8_t *outpu
+       ruy::MulParams<std::int32_t, std::int32_t> mul_params;
+       ruy::Mul(lhs, rhs, mul_params, &context, &dst);
+ 
++      // D0: refresh this thread's share of the global prepacked-byte total.
++      // Only under the lifecycle gate -- it costs a cache read per GEMM.
++      if (lifecycle::enabled()) {
++        const long long bytes = static_cast<long long>(
++            ruy::get_ctx(&context)->GetPrepackedCache()->BuffersBytes());
++        if (bytes != accountedPrepackedBytes) {
++          lifecycle::ruyPrepackedBytes().fetch_add(bytes - accountedPrepackedBytes,
++                                                   std::memory_order_relaxed);
++          accountedPrepackedBytes = bytes;
++        }
++      }
++
+       }  // PATCH C: end of the ruy path
+ 
+       // Unquantise:
+diff --git a/engine/marian-fork/src/tensors/cpu/smmla_gemm.cpp b/engine/marian-fork/src/tensors/cpu/smmla_gemm.cpp
+index c592499..df5b231 100644
+--- a/engine/marian-fork/src/tensors/cpu/smmla_gemm.cpp
++++ b/engine/marian-fork/src/tensors/cpu/smmla_gemm.cpp
+@@ -14,6 +14,8 @@
+ #include <unordered_map>
+ #include <vector>
+ 
++#include "common/lifecycle.h"  // D0: packing-cache tracing
++
+ #if defined(__linux__)
+ #include <sys/auxv.h>
+ #ifndef AT_HWCAP2
+@@ -257,6 +259,37 @@ thread_local std::vector<int8_t> aScratch;
+ thread_local std::vector<int8_t> bScratch;
+ thread_local uint64_t seenGeneration = 0;
+ thread_local testing::TileCounters tileCounts;
++// D0: this thread's contribution to the process-wide cache/scratch totals,
++// maintained only while lifecycle tracing is on. Declared after the caches
++// above so it is destroyed before them at thread exit: the global totals then
++// drop when a worker thread goes away.
++struct CacheAccount {
++  long long packed = 0;
++  long long scratch = 0;
++  ~CacheAccount() {
++    if (packed != 0) lifecycle::smmlaPackedBytes().fetch_sub(packed, std::memory_order_relaxed);
++    if (scratch != 0) lifecycle::smmlaScratchBytes().fetch_sub(scratch, std::memory_order_relaxed);
++  }
++};
++thread_local CacheAccount cacheAccount;
++
++// D0: publish this thread's current bCache / scratch footprint. Called only
++// where a size can actually have changed.
++void publishCacheBytes() {
++  if (!lifecycle::enabled()) return;
++  long long packed = 0;
++  for (const auto& entry : bCache) packed += static_cast<long long>(entry.second.data.capacity());
++  const long long scratch =
++      static_cast<long long>(aScratch.capacity()) + static_cast<long long>(bScratch.capacity());
++  if (packed != cacheAccount.packed) {
++    lifecycle::smmlaPackedBytes().fetch_add(packed - cacheAccount.packed, std::memory_order_relaxed);
++    cacheAccount.packed = packed;
++  }
++  if (scratch != cacheAccount.scratch) {
++    lifecycle::smmlaScratchBytes().fetch_add(scratch - cacheAccount.scratch, std::memory_order_relaxed);
++    cacheAccount.scratch = scratch;
++  }
++}
+ 
+ }  // namespace
+ 
+@@ -285,8 +318,16 @@ void gemm8(const int8_t* A,
+   const size_t stripBytes = static_cast<size_t>(K8) * 16;
+ 
+   if (generation != seenGeneration) {
++    if (lifecycle::enabled()) {
++      lifecycle::event("smmla_bcache_cleared entries=%zu bytes=%lld scratch_bytes=%lld generation=%llu->%llu",
++                       bCache.size(), cacheAccount.packed,
++                       static_cast<long long>(aScratch.capacity()) + static_cast<long long>(bScratch.capacity()),
++                       static_cast<unsigned long long>(seenGeneration),
++                       static_cast<unsigned long long>(generation));
++    }
+     bCache.clear();
+     seenGeneration = generation;
++    publishCacheBytes();
+   }
+ 
+   // packStrips writes every byte of its output (zero pads included), so the
+@@ -302,15 +343,20 @@ void gemm8(const int8_t* A,
+       e.K = K;
+       e.N = N;
+       e.generation = generation;
++      publishCacheBytes();
+     }
+     bPacked = e.data.data();
+   } else {
++    const size_t before = bScratch.capacity();
+     ensure(bScratch, static_cast<size_t>(nPairs) * stripBytes);
++    if (bScratch.capacity() != before) publishCacheBytes();
+     packStrips(B, N, K, bScratch.data());
+     bPacked = bScratch.data();
+   }
+ 
++  const size_t aBefore = aScratch.capacity();
+   ensure(aScratch, static_cast<size_t>(mPairs) * stripBytes);
++  if (aScratch.capacity() != aBefore) publishCacheBytes();
+   packStrips(A, M, K, aScratch.data());
+ 
+   for (int rp = 0; rp < mPairs; rp += 4) {
+@@ -347,6 +393,21 @@ void gemm8(const int8_t* A,
+   }
+ }
+ 
++void releaseThreadCaches() {
++  const size_t entries = bCache.size();
++  const long long packed = cacheAccount.packed;
++  const long long scratch = cacheAccount.scratch;
++  // swap-with-empty rather than clear(): clear() keeps the hash buckets and
++  // vector capacity, which is exactly the memory we are here to give back.
++  std::unordered_map<const void*, PackedB>().swap(bCache);
++  std::vector<int8_t>().swap(aScratch);
++  std::vector<int8_t>().swap(bScratch);
++  publishCacheBytes();
++  if (lifecycle::enabled() && (entries != 0 || scratch != 0)) {
++    lifecycle::event("smmla_released entries=%zu bytes=%lld scratch_bytes=%lld", entries, packed, scratch);
++  }
++}
++
+ }  // namespace smmla
+ }  // namespace integer
+ }  // namespace cpu
+@@ -360,6 +421,7 @@ namespace integer {
+ namespace smmla {
+ bool available() { return false; }
+ void gemm8(const int8_t*, const int8_t*, int32_t*, int, int, int, bool, uint64_t) {}
++void releaseThreadCaches() {}
+ namespace testing {
+ size_t packedBytes(int, int) { return 0; }
+ void packStrips(const int8_t*, int, int, int8_t*) {}
+diff --git a/engine/marian-fork/src/tensors/cpu/smmla_gemm.h b/engine/marian-fork/src/tensors/cpu/smmla_gemm.h
+index ac63efe..47fe74a 100644
+--- a/engine/marian-fork/src/tensors/cpu/smmla_gemm.h
++++ b/engine/marian-fork/src/tensors/cpu/smmla_gemm.h
+@@ -37,6 +37,12 @@ void gemm8(const int8_t* A,
+            bool cacheableB,
+            uint64_t generation);
+ 
++// D0: drop THIS thread's packed-B cache and release its scratch buffers.
++// Affects only the calling thread; safe on a thread that never ran a GEMM.
++// The next gemm8 on this thread simply re-packs, so this is a memory/latency
++// trade, never a correctness one.
++void releaseThreadCaches();
++
+ // Test hooks -- not part of the engine contract. They let the test set check
+ // the packer on its own (guard-paged output, byte compare against an
+ // independent reference) and assert that every tile variant actually ran.
+diff --git a/engine/src/translator/service.cpp b/engine/src/translator/service.cpp
+index 32cd023..d84930a 100644
+--- a/engine/src/translator/service.cpp
++++ b/engine/src/translator/service.cpp
+@@ -3,9 +3,17 @@
+ #include <string>
+ #include <utility>
+ 
++#if defined(__ANDROID__) || defined(__GLIBC__)
++#include <malloc.h>
++#elif defined(__APPLE__)
++#include <malloc/malloc.h>
++#endif
++
+ #include "batch.h"
+ #include "byte_array_util.h"
++#include "common/lifecycle.h"                // D0: worker/service lifecycle tracing
+ #include "definitions.h"
++#include "tensors/cpu/integer_common.h"  // D0: releaseThreadPackingCaches()
+ 
+ namespace marian {
+ namespace bergamot {
+@@ -34,6 +42,26 @@ std::optional<TranslationCache> makeOptionalCache(size_t size, size_t mutexBucke
+   return size > 0 ? std::make_optional<TranslationCache>(size, mutexBuckets) : std::nullopt;
+ }
+ 
++// D0: hand freed pages back to the OS. Freeing to the allocator is not the
++// same as shrinking RSS -- bionic's scudo and macOS libmalloc both keep
++// per-thread magazines that otherwise only drain when the thread exits, so a
++// release that frees tens of MB can leave RSS completely flat. Only called on
++// the explicit release path (onTrimMemory-ish moments), never during
++// translation: a purge costs milliseconds and re-faults pages afterwards.
++void purgeAllocator() {
++#if defined(__ANDROID__)
++#if defined(M_PURGE_ALL)
++  mallopt(M_PURGE_ALL, 0);
++#elif defined(M_PURGE)
++  mallopt(M_PURGE, 0);
++#endif
++#elif defined(__APPLE__)
++  malloc_zone_pressure_relief(nullptr, 0);
++#elif defined(__GLIBC__)
++  malloc_trim(0);
++#endif
++}
++
+ }  // namespace
+ 
+ BlockingService::BlockingService(const BlockingService::Config &config)
+@@ -80,6 +108,21 @@ std::vector<Response> BlockingService::translateMultipleRaw(std::shared_ptr<Tran
+   return responses;
+ }
+ 
++bool BlockingService::release(std::shared_ptr<TranslationModel> &&model) {
++  std::weak_ptr<TranslationModel> observer = model;
++  if (lifecycle::enabled() && model) lifecycle::event("service_release id=%zu", model->modelId());
++  model.reset();
++  // translateMultipleRaw() drains the aggregate queue before returning, so
++  // there is nothing to clear there; the packing caches, however, belong to
++  // this very thread and would otherwise wait for a GEMM that may never come.
++  batchingPool_.clear();
++  marian::cpu::integer::releaseThreadPackingCaches();
++  purgeAllocator();
++  const bool destroyed = observer.expired();
++  if (lifecycle::enabled()) lifecycle::event("service_release_done destroyed=%d", destroyed ? 1 : 0);
++  return destroyed;
++}
++
+ std::vector<Response> BlockingService::pivotMultiple(std::shared_ptr<TranslationModel> first,
+                                                      std::shared_ptr<TranslationModel> second,
+                                                      std::vector<std::string> &&sources,
+@@ -136,29 +179,74 @@ AsyncService::AsyncService(const AsyncService::Config &config)
+       cache_(makeOptionalCache(config_.cacheSize, /*mutexBuckets=*/config_.numWorkers)),
+       logger_(config.logger) {
+   ABORT_IF(config_.numWorkers == 0, "Number of workers should be at least 1 in a threaded workflow");
++  if (lifecycle::enabled()) lifecycle::event("service_ctor workers=%zu", config_.numWorkers);
+   workers_.reserve(config_.numWorkers);
++  safeBatchingPool_.setConsumerCount(config_.numWorkers);
+   for (size_t cpuId = 0; cpuId < config_.numWorkers; cpuId++) {
+     workers_.emplace_back([cpuId, this] {
+       // Consumer thread main-loop. Note that this is an infinite-loop unless the monitor is explicitly told to
+       // shutdown, which happens in the destructor for this class.
+       Batch batch;
+       Ptr<TranslationModel> translationModel{nullptr};
+-      while (safeBatchingPool_.generateBatch(translationModel, batch)) {
++      size_t seenMaintenanceEpoch = 0;
++      for (;;) {
++        bool maintenanceDue = false;
++        size_t sentences = safeBatchingPool_.generateBatch(seenMaintenanceEpoch, maintenanceDue, translationModel,
++                                                           batch);
++        if (maintenanceDue) {
++          // D0: everything this thread holds on a model's behalf goes here.
++          batch.clear();
++          translationModel.reset();
++          marian::cpu::integer::releaseThreadPackingCaches();
++          purgeAllocator();
++          if (lifecycle::enabled()) lifecycle::event("worker_maintenance cpu=%zu", cpuId);
++          safeBatchingPool_.ackMaintenance();
++          continue;
++        }
++        if (sentences == 0) break;  // shutdown
+         translationModel->translateBatch(cpuId, batch);
++        // D0: drop the batch's RequestSentences and this worker's owning model
++        // reference before blocking again. Without this the last batch's model
++        // stays alive for as long as the worker sits idle -- which is forever,
++        // in an app that has stopped translating.
++        batch.clear();
++        translationModel.reset();
+       }
++      if (lifecycle::enabled()) lifecycle::event("worker_shutdown cpu=%zu", cpuId);
+     });
+   }
+ }
+ 
++bool AsyncService::release(std::shared_ptr<TranslationModel> &&model) {
++  std::weak_ptr<TranslationModel> observer = model;
++  if (lifecycle::enabled() && model) lifecycle::event("service_release id=%zu", model->modelId());
++  model.reset();
++  safeBatchingPool_.runMaintenance();
++  // The model itself was freed on whichever thread dropped the last reference
++  // -- possibly this one -- so purge here too, not only on the workers.
++  purgeAllocator();
++  const bool destroyed = observer.expired();
++  if (lifecycle::enabled()) lifecycle::event("service_release_done destroyed=%d", destroyed ? 1 : 0);
++  return destroyed;
++}
++
++void AsyncService::drain() { safeBatchingPool_.runMaintenance(); }
++
+ void AsyncService::clear() { safeBatchingPool_.clear(); }
+ 
+ AsyncService::~AsyncService() {
++  if (lifecycle::enabled()) lifecycle::event("service_dtor_enter workers=%zu", workers_.size());
+   safeBatchingPool_.shutdown();
+   for (std::thread &worker : workers_) {
+     assert(worker.joinable());
+     worker.join();
+   }
+   workers_.clear();
++  if (lifecycle::enabled()) {
++    lifecycle::event("service_dtor_done live_models=%ld live_graphs=%ld",
++                     lifecycle::liveModels().load(std::memory_order_relaxed),
++                     lifecycle::liveGraphs().load(std::memory_order_relaxed));
++  }
+ }
+ 
+ void AsyncService::pivot(std::shared_ptr<TranslationModel> first, std::shared_ptr<TranslationModel> second,
+diff --git a/engine/src/translator/service.h b/engine/src/translator/service.h
+index 1e4c9ba..cd58140 100644
+--- a/engine/src/translator/service.h
++++ b/engine/src/translator/service.h
+@@ -80,6 +80,15 @@ class BlockingService {
+   std::vector<Response> pivotMultiple(std::shared_ptr<TranslationModel> first, std::shared_ptr<TranslationModel> second,
+                                       std::vector<std::string> &&sources,
+                                       const std::vector<ResponseOptions> &responseOptions);
++  /// D0: drop `model` and reclaim what this service holds on its behalf.
++  /// BlockingService has no worker threads, so the GEMM weight-packing caches
++  /// live on the calling thread and are cleared here directly.
++  ///
++  /// @param [move] model: the caller's handle, reset by this call.
++  /// @returns true when nothing else held a reference, i.e. the model was
++  /// actually destroyed by this call.
++  bool release(std::shared_ptr<TranslationModel> &&model);
++
+   TranslationCache::Stats cacheStats() { return cache_ ? cache_->stats() : TranslationCache::Stats(); }
+ 
+  private:
+@@ -161,6 +170,27 @@ class AsyncService {
+   /// Clears all pending requests.
+   void clear();
+ 
++  /// D0: drop `model` and reclaim everything this service holds on its behalf
++  /// -- each worker's cached model reference and last batch, the aggregate
++  /// queue's reference, and every worker's GEMM weight-packing caches. This is
++  /// the counterpart of createCompatibleModel(); simply dropping the handle
++  /// frees none of the above until the service itself is destroyed.
++  ///
++  /// @param [move] model: the caller's handle, reset by this call.
++  /// @returns true when nothing else held a reference, i.e. the model was
++  /// actually destroyed by this call. False means a request is still in flight
++  /// (or the caller kept another copy); the model dies when that finishes.
++  ///
++  /// Blocks until every worker acknowledges, bounded by one in-flight batch.
++  /// MUST NOT be called from a translation callback: those run on worker
++  /// threads and the acknowledgement would never come.
++  bool release(std::shared_ptr<TranslationModel> &&model);
++
++  /// The maintenance half of release() without a handle to drop: every worker
++  /// drops its cached model reference and its packing caches. Same threading
++  /// contract as release().
++  void drain();
++
+   /// Thread joins and proper shutdown are required to be handled explicitly.
+   /// If you do not want to wait, call `clear()` before destructor.
+   ~AsyncService();
+diff --git a/engine/src/translator/threadsafe_batching_pool.cpp b/engine/src/translator/threadsafe_batching_pool.cpp
+index 29ad35a..0752674 100644
+--- a/engine/src/translator/threadsafe_batching_pool.cpp
++++ b/engine/src/translator/threadsafe_batching_pool.cpp
+@@ -39,16 +39,63 @@ void ThreadsafeBatchingPool<BatchingPoolType>::shutdown() {
+   std::unique_lock<std::mutex> lock(mutex_);
+   shutdown_ = true;
+   work_.notify_all();
++  // A runMaintenance() blocked on acknowledgements must not outlive shutdown.
++  maintenanceDone_.notify_all();
++}
++
++template <class BatchingPoolType>
++void ThreadsafeBatchingPool<BatchingPoolType>::setConsumerCount(size_t consumers) {
++  std::unique_lock<std::mutex> lock(mutex_);
++  consumers_ = consumers;
++}
++
++template <class BatchingPoolType>
++void ThreadsafeBatchingPool<BatchingPoolType>::runMaintenance() {
++  std::unique_lock<std::mutex> serial(maintenanceSerial_);
++  std::unique_lock<std::mutex> lock(mutex_);
++  if (consumers_ == 0 || shutdown_) return;
++  // Only safe with nothing pending: the aggregate queue is how a model's
++  // batching pool is reached at all, so dropping it while sentences are
++  // enqueued would strand them. generateBatch() already clears at that point;
++  // this covers the paths that do not go through it.
++  if (enqueued_ == 0) backend_.clear();
++  ++maintenanceEpoch_;
++  maintenanceAcked_ = 0;
++  work_.notify_all();
++  maintenanceDone_.wait(lock, [this]() { return maintenanceAcked_ >= consumers_ || shutdown_; });
++}
++
++template <class BatchingPoolType>
++void ThreadsafeBatchingPool<BatchingPoolType>::ackMaintenance() {
++  std::unique_lock<std::mutex> lock(mutex_);
++  ++maintenanceAcked_;
++  maintenanceDone_.notify_all();
+ }
+ 
+ template <class BatchingPoolType>
+ template <class... Args>
+-size_t ThreadsafeBatchingPool<BatchingPoolType>::generateBatch(Args &&...args) {
++size_t ThreadsafeBatchingPool<BatchingPoolType>::generateBatch(size_t &seenMaintenanceEpoch, bool &maintenanceDue,
++                                                               Args &&...args) {
+   std::unique_lock<std::mutex> lock(mutex_);
+-  work_.wait(lock, [this]() { return enqueued_ || shutdown_; });
++  work_.wait(lock, [this, &seenMaintenanceEpoch]() {
++    return enqueued_ || shutdown_ || maintenanceEpoch_ != seenMaintenanceEpoch;
++  });
++  // Maintenance is checked before work on purpose: a release must not wait for
++  // a backlog to drain.
++  if (maintenanceEpoch_ != seenMaintenanceEpoch) {
++    seenMaintenanceEpoch = maintenanceEpoch_;
++    maintenanceDue = true;
++    return 0;
++  }
++  maintenanceDue = false;
+   size_t sentencesInBatch = backend_.generateBatch(std::forward<Args>(args)...);
+   assert(sentencesInBatch > 0 || shutdown_);
+   enqueued_ -= sentencesInBatch;
++  // D0: with nothing left pending, the aggregate queue's owning references to
++  // TranslationModels are dead weight -- it would otherwise hold them until
++  // some later generateBatch found that model's pool empty, which only happens
++  // once new work arrives. enqueueRequest() re-inserts, so this is safe.
++  if (enqueued_ == 0) backend_.clear();
+   return sentencesInBatch;
+ }
+ 
+diff --git a/engine/src/translator/threadsafe_batching_pool.h b/engine/src/translator/threadsafe_batching_pool.h
+index 9f46abb..05c6619 100644
+--- a/engine/src/translator/threadsafe_batching_pool.h
++++ b/engine/src/translator/threadsafe_batching_pool.h
+@@ -40,12 +40,42 @@ class ThreadsafeBatchingPool {
+   template <class... Args>
+   void enqueueRequest(Args &&...args);
+ 
++  /// Consumer side. Blocks until there is a batch, a shutdown, or a
++  /// maintenance request (D0).
++  ///
++  /// @param [in,out] seenMaintenanceEpoch: consumer-owned; the epoch this
++  /// consumer has already serviced. Start it at 0.
++  /// @param [out] maintenanceDue: set when this consumer owes a maintenance
++  /// pass. The return value is then 0 and no batch was produced; run the pass
++  /// and call ackMaintenance().
++  /// @returns sentences in the produced batch; 0 means shutdown (or, with
++  /// maintenanceDue set, a maintenance wake-up).
+   template <class... Args>
+-  size_t generateBatch(Args &&...args);
++  size_t generateBatch(size_t &seenMaintenanceEpoch, bool &maintenanceDue, Args &&...args);
+ 
+   // Removes any pending requests from the batching pool.
+   void clear();
+ 
++  /// D0: how many consumers call generateBatch. Must be set before they start;
++  /// runMaintenance() waits for exactly this many acknowledgements.
++  void setConsumerCount(size_t consumers);
++
++  /// D0, producer side. Wakes every consumer, has each run one maintenance
++  /// pass (drop its cached model reference and its GEMM packing caches), and
++  /// blocks until all of them have acknowledged. Also drops the aggregate
++  /// queue's model references when nothing is pending.
++  ///
++  /// Bounded by one in-flight batch: a consumer inside translateBatch only
++  /// notices on its way back round, but the maintenance check is ahead of the
++  /// batch check, so queued work cannot starve it.
++  ///
++  /// MUST NOT be called from a consumer thread (i.e. from a translation
++  /// callback): that consumer could never acknowledge and this would deadlock.
++  void runMaintenance();
++
++  /// Consumer side, after finishing a maintenance pass.
++  void ackMaintenance();
++
+   // Signals shut down of batching pool. After this no new requests can be enqueued,
+   // but all enqueued requests will be processed. To prevent this from happening,
+   // call `clear()` before `shutdown()`.
+@@ -60,11 +90,22 @@ class ThreadsafeBatchingPool {
+   // Are we shutting down?
+   bool shutdown_;
+ 
+-  // Lock on this object.
++  // Lock on this object. Guards every member below as well as backend_,
++  // enqueued_ and shutdown_.
+   std::mutex mutex_;
+ 
+-  // Signaled when there are sentences to translate.
++  // Signaled when there are sentences to translate, on shutdown, and on a new
++  // maintenance epoch.
+   std::condition_variable work_;
++
++  // D0 maintenance protocol.
++  // Lock order, where both are taken: maintenanceSerial_ then mutex_. Never
++  // the reverse; consumers only ever take mutex_.
++  std::mutex maintenanceSerial_;         // serialises concurrent runMaintenance()
++  std::condition_variable maintenanceDone_;  // signaled by ackMaintenance()
++  size_t consumers_{0};
++  size_t maintenanceEpoch_{0};
++  size_t maintenanceAcked_{0};
+ };
+ 
+ }  // namespace bergamot
+diff --git a/engine/src/translator/translation_model.cpp b/engine/src/translator/translation_model.cpp
+index 294c738..b31cc14 100644
+--- a/engine/src/translator/translation_model.cpp
++++ b/engine/src/translator/translation_model.cpp
+@@ -3,6 +3,7 @@
+ #include "batch.h"
+ #include "byte_array_util.h"
+ #include "cache.h"
++#include "common/lifecycle.h"  // D0: model/backend lifecycle tracing
+ #include "common/logging.h"
+ #include "data/corpus.h"
+ #include "data/text_input.h"
+@@ -53,16 +54,60 @@ TranslationModel::TranslationModel(const Config &options, MemoryBundle &&memory
+     // In this case, the loadpath does not load shortlist.
+     shortlistGenerator_ = nullptr;
+   }
++
++  lifecycle::liveModels().fetch_add(1, std::memory_order_relaxed);
++  if (lifecycle::enabled()) {
++    lifecycle::event("model_ctor id=%zu replicas=%zu model_bytes=%zu shortlist_bytes=%zu", modelId_, replicas,
++                     modelMemoryBytes(), memory_.shortlist.size());
++  }
+ }
+ 
+ // PATCH B: see translation_model.h. Bumping here makes every worker thread drop
+ // its ruy prepacked-weight cache before any replacement model can be handed the
+ // freed weight addresses.
+-TranslationModel::~TranslationModel() { marian::cpu::integer::bumpPrepackGeneration(); }
++TranslationModel::~TranslationModel() {
++  if (lifecycle::enabled()) {
++    size_t loaded = 0;
++    for (const auto &backend : backend_) loaded += backend.initialized ? 1 : 0;
++    // model_bytes>0 here means some replica was never used, so loadBackend()
++    // never got to drop the file image (D0, lazy-replica residue).
++    lifecycle::event("model_dtor_enter id=%zu replicas=%zu backends_loaded=%zu model_bytes=%zu", modelId_,
++                     backend_.size(), loaded, modelMemoryBytes());
++  }
++  marian::cpu::integer::bumpPrepackGeneration();
++  // Release graphs + scorers here rather than leaving it to member destruction,
++  // so the counters logged below already reflect the freed ExpressionGraphs.
++  // Safe: scorers hold their own shared_ptr to shortlistGenerator_, and the
++  // graph stopped referencing memory_.models once loadBackend ran forward().
++  // memory_ is deliberately NOT cleared -- BinaryShortlistGenerator keeps a raw
++  // pointer into memory_.shortlist, and member destruction order already frees
++  // the generator first.
++  backend_.clear();
++  lifecycle::liveModels().fetch_sub(1, std::memory_order_relaxed);
++  if (lifecycle::enabled()) {
++    lifecycle::event("model_dtor_done id=%zu live_models=%ld live_graphs=%ld", modelId_,
++                     lifecycle::liveModels().load(std::memory_order_relaxed),
++                     lifecycle::liveGraphs().load(std::memory_order_relaxed));
++  }
++}
++
++size_t TranslationModel::modelMemoryBytes() const {
++  // The file image lives behind modelMemory_ (patch 0016), not memory_.models,
++  // and stays pinned until every replica has loaded -- so a non-zero value in
++  // the destructor means some replica was never used.
++  size_t bytes = 0;
++  if (auto memory = std::atomic_load(&modelMemory_)) {
++    for (const auto &model : *memory) bytes += model.size();
++  }
++  return bytes;
++}
+ 
+ void TranslationModel::loadBackend(size_t idx) {
+   auto &graph = backend_[idx].graph;
+   auto &scorerEnsemble = backend_[idx].scorerEnsemble;
++  if (lifecycle::enabled()) {
++    lifecycle::event("load_backend_begin id=%zu replica=%zu model_bytes=%zu", modelId_, idx, modelMemoryBytes());
++  }
+ 
+   marian::DeviceId device_(idx, DeviceType::cpu);
+   graph = New<ExpressionGraph>(/*inference=*/true);  // set the graph to be inference only
+@@ -130,7 +175,16 @@ void TranslationModel::loadBackend(size_t idx) {
+   // them freed memory). Replicas that loaded concurrently keep their own pin
+   // until they leave this function.
+   if (backendsLoaded_.fetch_add(1) + 1 == backend_.size()) {
++    const size_t releasedBytes = modelMemoryBytes();
+     std::atomic_store(&modelMemory_, std::shared_ptr<std::vector<AlignedMemory>>());
++    if (lifecycle::enabled()) {
++      // The local pin above still holds the bytes until this function returns.
++      lifecycle::event("model_memory_released id=%zu replica=%zu bytes=%zu", modelId_, idx, releasedBytes);
++    }
++  }
++  if (lifecycle::enabled()) {
++    lifecycle::event("load_backend_end id=%zu replica=%zu live_graphs=%ld", modelId_, idx,
++                     lifecycle::liveGraphs().load(std::memory_order_relaxed));
+   }
+ }
+ 
+diff --git a/engine/src/translator/translation_model.h b/engine/src/translator/translation_model.h
+index d5298bb..510a042 100644
+--- a/engine/src/translator/translation_model.h
++++ b/engine/src/translator/translation_model.h
+@@ -157,6 +157,10 @@ class TranslationModel {
+   std::shared_ptr<QualityEstimator> qualityEstimator_;
+ 
+   void loadBackend(size_t idx);
++  /// D0 diagnostic: bytes still held by the raw model file image. Non-zero
++  /// after translation means some replica was never loaded, so loadBackend()
++  /// never reached the point where it drops the image.
++  size_t modelMemoryBytes() const;
+   Ptr<marian::data::CorpusBatch> convertToMarianBatch(Batch& batch);
+ 
+   static std::atomic<size_t> modelCounter_;
+-- 
+2.54.0
+

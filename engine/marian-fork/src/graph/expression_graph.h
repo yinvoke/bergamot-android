@@ -176,11 +176,8 @@ public:
    */
   ExpressionGraph(bool inference = false);
 
-  virtual ~ExpressionGraph() {
-    clear();
-    for(auto kvParams : paramsByElementType_)
-      kvParams.second->clear();
-  }
+  // D0: defined in expression_graph.cpp so it can keep the live-graph counter.
+  virtual ~ExpressionGraph();
 
   virtual void setDevice(DeviceId deviceId = {0, DeviceType::gpu},
                          Ptr<Device> device = nullptr);

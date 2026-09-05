@@ -44,6 +44,17 @@ namespace integer {
 std::atomic<uint64_t> &prepackGeneration();
 void bumpPrepackGeneration();
 
+// D0: drop THIS thread's GEMM weight-packing caches -- ruy's prepacked cache
+// and, on i8mm CPUs, the SMMLA packed-B cache and scratch buffers. They are
+// thread_local, so a model teardown on another thread cannot free them; the
+// generation guard above only reclaims them lazily, at the next GEMM this
+// thread happens to run, which never comes if translation has stopped. The
+// service's release path calls this on every worker.
+//
+// Correctness-neutral: the next GEMM on this thread re-packs from the model's
+// own weights. Only affects the calling thread.
+void releaseThreadPackingCaches();
+
 // Making sure we have access to common functions for RUY and INTGEMM
 class fetchAlphaFromModelNodeOp : public UnaryNodeOp {
 public:

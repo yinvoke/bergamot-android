@@ -80,6 +80,15 @@ class BlockingService {
   std::vector<Response> pivotMultiple(std::shared_ptr<TranslationModel> first, std::shared_ptr<TranslationModel> second,
                                       std::vector<std::string> &&sources,
                                       const std::vector<ResponseOptions> &responseOptions);
+  /// D0: drop `model` and reclaim what this service holds on its behalf.
+  /// BlockingService has no worker threads, so the GEMM weight-packing caches
+  /// live on the calling thread and are cleared here directly.
+  ///
+  /// @param [move] model: the caller's handle, reset by this call.
+  /// @returns true when nothing else held a reference, i.e. the model was
+  /// actually destroyed by this call.
+  bool release(std::shared_ptr<TranslationModel> &&model);
+
   TranslationCache::Stats cacheStats() { return cache_ ? cache_->stats() : TranslationCache::Stats(); }
 
  private:
@@ -160,6 +169,27 @@ class AsyncService {
 
   /// Clears all pending requests.
   void clear();
+
+  /// D0: drop `model` and reclaim everything this service holds on its behalf
+  /// -- each worker's cached model reference and last batch, the aggregate
+  /// queue's reference, and every worker's GEMM weight-packing caches. This is
+  /// the counterpart of createCompatibleModel(); simply dropping the handle
+  /// frees none of the above until the service itself is destroyed.
+  ///
+  /// @param [move] model: the caller's handle, reset by this call.
+  /// @returns true when nothing else held a reference, i.e. the model was
+  /// actually destroyed by this call. False means a request is still in flight
+  /// (or the caller kept another copy); the model dies when that finishes.
+  ///
+  /// Blocks until every worker acknowledges, bounded by one in-flight batch.
+  /// MUST NOT be called from a translation callback: those run on worker
+  /// threads and the acknowledgement would never come.
+  bool release(std::shared_ptr<TranslationModel> &&model);
+
+  /// The maintenance half of release() without a handle to drop: every worker
+  /// drops its cached model reference and its packing caches. Same threading
+  /// contract as release().
+  void drain();
 
   /// Thread joins and proper shutdown are required to be handled explicitly.
   /// If you do not want to wait, call `clear()` before destructor.

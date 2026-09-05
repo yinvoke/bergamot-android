@@ -1,4 +1,5 @@
 #include "graph/expression_graph.h"
+#include "common/lifecycle.h"  // D0: graph lifetime counter
 #include "tensors/tensor_operators.h"
 
 #include <sstream>
@@ -7,7 +8,21 @@ namespace marian {
 
 ExpressionGraph::ExpressionGraph(bool inference)
   : inferenceOnly_(inference),
-    backend_(nullptr) {}
+    backend_(nullptr) {
+  lifecycle::liveGraphs().fetch_add(1, std::memory_order_relaxed);
+}
+
+// D0: out-of-line so the counter lives next to the constructor's. The body is
+// what the header used to hold inline.
+ExpressionGraph::~ExpressionGraph() {
+  clear();
+  for(auto kvParams : paramsByElementType_)
+    kvParams.second->clear();
+  lifecycle::liveGraphs().fetch_sub(1, std::memory_order_relaxed);
+  if(lifecycle::enabled())
+    lifecycle::event("graph_dtor live_graphs=%ld",
+                     lifecycle::liveGraphs().load(std::memory_order_relaxed));
+}
 
 void ExpressionGraph::setDevice(DeviceId deviceId, Ptr<Device> device) {
   if(!backend_) {

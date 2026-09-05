@@ -1,5 +1,14 @@
 #include "integer_common.h"
 
+// D0: releaseThreadPackingCaches() needs the per-thread cache owners. Both are
+// architecture-gated exactly as their GEMM paths are.
+#if defined(ARM)
+#include "ruy_interface.h"
+#endif
+#if defined(__aarch64__)
+#include "smmla_gemm.h"
+#endif
+
 #ifdef __SSE__
 #include <emmintrin.h>
 #include <immintrin.h>
@@ -22,6 +31,18 @@ std::atomic<uint64_t> &prepackGeneration() {
 
 void bumpPrepackGeneration() {
   prepackGeneration().fetch_add(1, std::memory_order_relaxed);
+}
+
+// D0: see integer_common.h. Both caches are per-thread, so this only ever
+// touches the calling thread's state -- no locking needed, and no ordering
+// against other threads' GEMMs.
+void releaseThreadPackingCaches() {
+#if defined(ARM)
+  releaseThreadRuyCache();
+#endif
+#if defined(__aarch64__)
+  smmla::releaseThreadCaches();
+#endif
 }
 
 // This operates on floats after processing so doesn't care about int8_t vs int16_t.

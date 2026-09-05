@@ -14,6 +14,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "common/lifecycle.h"  // D0: packing-cache tracing
+
 #if defined(__linux__)
 #include <sys/auxv.h>
 #ifndef AT_HWCAP2
@@ -257,6 +259,37 @@ thread_local std::vector<int8_t> aScratch;
 thread_local std::vector<int8_t> bScratch;
 thread_local uint64_t seenGeneration = 0;
 thread_local testing::TileCounters tileCounts;
+// D0: this thread's contribution to the process-wide cache/scratch totals,
+// maintained only while lifecycle tracing is on. Declared after the caches
+// above so it is destroyed before them at thread exit: the global totals then
+// drop when a worker thread goes away.
+struct CacheAccount {
+  long long packed = 0;
+  long long scratch = 0;
+  ~CacheAccount() {
+    if (packed != 0) lifecycle::smmlaPackedBytes().fetch_sub(packed, std::memory_order_relaxed);
+    if (scratch != 0) lifecycle::smmlaScratchBytes().fetch_sub(scratch, std::memory_order_relaxed);
+  }
+};
+thread_local CacheAccount cacheAccount;
+
+// D0: publish this thread's current bCache / scratch footprint. Called only
+// where a size can actually have changed.
+void publishCacheBytes() {
+  if (!lifecycle::enabled()) return;
+  long long packed = 0;
+  for (const auto& entry : bCache) packed += static_cast<long long>(entry.second.data.capacity());
+  const long long scratch =
+      static_cast<long long>(aScratch.capacity()) + static_cast<long long>(bScratch.capacity());
+  if (packed != cacheAccount.packed) {
+    lifecycle::smmlaPackedBytes().fetch_add(packed - cacheAccount.packed, std::memory_order_relaxed);
+    cacheAccount.packed = packed;
+  }
+  if (scratch != cacheAccount.scratch) {
+    lifecycle::smmlaScratchBytes().fetch_add(scratch - cacheAccount.scratch, std::memory_order_relaxed);
+    cacheAccount.scratch = scratch;
+  }
+}
 
 }  // namespace
 
@@ -285,8 +318,16 @@ void gemm8(const int8_t* A,
   const size_t stripBytes = static_cast<size_t>(K8) * 16;
 
   if (generation != seenGeneration) {
+    if (lifecycle::enabled()) {
+      lifecycle::event("smmla_bcache_cleared entries=%zu bytes=%lld scratch_bytes=%lld generation=%llu->%llu",
+                       bCache.size(), cacheAccount.packed,
+                       static_cast<long long>(aScratch.capacity()) + static_cast<long long>(bScratch.capacity()),
+                       static_cast<unsigned long long>(seenGeneration),
+                       static_cast<unsigned long long>(generation));
+    }
     bCache.clear();
     seenGeneration = generation;
+    publishCacheBytes();
   }
 
   // packStrips writes every byte of its output (zero pads included), so the
@@ -302,15 +343,20 @@ void gemm8(const int8_t* A,
       e.K = K;
       e.N = N;
       e.generation = generation;
+      publishCacheBytes();
     }
     bPacked = e.data.data();
   } else {
+    const size_t before = bScratch.capacity();
     ensure(bScratch, static_cast<size_t>(nPairs) * stripBytes);
+    if (bScratch.capacity() != before) publishCacheBytes();
     packStrips(B, N, K, bScratch.data());
     bPacked = bScratch.data();
   }
 
+  const size_t aBefore = aScratch.capacity();
   ensure(aScratch, static_cast<size_t>(mPairs) * stripBytes);
+  if (aScratch.capacity() != aBefore) publishCacheBytes();
   packStrips(A, M, K, aScratch.data());
 
   for (int rp = 0; rp < mPairs; rp += 4) {
@@ -347,6 +393,21 @@ void gemm8(const int8_t* A,
   }
 }
 
+void releaseThreadCaches() {
+  const size_t entries = bCache.size();
+  const long long packed = cacheAccount.packed;
+  const long long scratch = cacheAccount.scratch;
+  // swap-with-empty rather than clear(): clear() keeps the hash buckets and
+  // vector capacity, which is exactly the memory we are here to give back.
+  std::unordered_map<const void*, PackedB>().swap(bCache);
+  std::vector<int8_t>().swap(aScratch);
+  std::vector<int8_t>().swap(bScratch);
+  publishCacheBytes();
+  if (lifecycle::enabled() && (entries != 0 || scratch != 0)) {
+    lifecycle::event("smmla_released entries=%zu bytes=%lld scratch_bytes=%lld", entries, packed, scratch);
+  }
+}
+
 }  // namespace smmla
 }  // namespace integer
 }  // namespace cpu
@@ -360,6 +421,7 @@ namespace integer {
 namespace smmla {
 bool available() { return false; }
 void gemm8(const int8_t*, const int8_t*, int32_t*, int, int, int, bool, uint64_t) {}
+void releaseThreadCaches() {}
 namespace testing {
 size_t packedBytes(int, int) { return 0; }
 void packStrips(const int8_t*, int, int, int8_t*) {}

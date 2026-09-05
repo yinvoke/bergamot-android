@@ -157,6 +157,10 @@ class TranslationModel {
   std::shared_ptr<QualityEstimator> qualityEstimator_;
 
   void loadBackend(size_t idx);
+  /// D0 diagnostic: bytes still held by the raw model file image. Non-zero
+  /// after translation means some replica was never loaded, so loadBackend()
+  /// never reached the point where it drops the image.
+  size_t modelMemoryBytes() const;
   Ptr<marian::data::CorpusBatch> convertToMarianBatch(Batch& batch);
 
   static std::atomic<size_t> modelCounter_;

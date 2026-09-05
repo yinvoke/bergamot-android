@@ -18,6 +18,7 @@ set(MARIAN_SOURCES
   common/version.cpp
   common/utils.cpp
   common/logging.cpp
+  common/lifecycle.cpp
   common/cli_helper.cpp
   common/cli_wrapper.cpp
   common/config.cpp

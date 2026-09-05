@@ -3,9 +3,17 @@
 #include <string>
 #include <utility>
 
+#if defined(__ANDROID__) || defined(__GLIBC__)
+#include <malloc.h>
+#elif defined(__APPLE__)
+#include <malloc/malloc.h>
+#endif
+
 #include "batch.h"
 #include "byte_array_util.h"
+#include "common/lifecycle.h"                // D0: worker/service lifecycle tracing
 #include "definitions.h"
+#include "tensors/cpu/integer_common.h"  // D0: releaseThreadPackingCaches()
 
 namespace marian {
 namespace bergamot {
@@ -32,6 +40,26 @@ Response combine(Response &&first, Response &&second) {
 
 std::optional<TranslationCache> makeOptionalCache(size_t size, size_t mutexBuckets) {
   return size > 0 ? std::make_optional<TranslationCache>(size, mutexBuckets) : std::nullopt;
+}
+
+// D0: hand freed pages back to the OS. Freeing to the allocator is not the
+// same as shrinking RSS -- bionic's scudo and macOS libmalloc both keep
+// per-thread magazines that otherwise only drain when the thread exits, so a
+// release that frees tens of MB can leave RSS completely flat. Only called on
+// the explicit release path (onTrimMemory-ish moments), never during
+// translation: a purge costs milliseconds and re-faults pages afterwards.
+void purgeAllocator() {
+#if defined(__ANDROID__)
+#if defined(M_PURGE_ALL)
+  mallopt(M_PURGE_ALL, 0);
+#elif defined(M_PURGE)
+  mallopt(M_PURGE, 0);
+#endif
+#elif defined(__APPLE__)
+  malloc_zone_pressure_relief(nullptr, 0);
+#elif defined(__GLIBC__)
+  malloc_trim(0);
+#endif
 }
 
 }  // namespace
@@ -78,6 +106,21 @@ std::vector<Response> BlockingService::translateMultipleRaw(std::shared_ptr<Tran
   }
 
   return responses;
+}
+
+bool BlockingService::release(std::shared_ptr<TranslationModel> &&model) {
+  std::weak_ptr<TranslationModel> observer = model;
+  if (lifecycle::enabled() && model) lifecycle::event("service_release id=%zu", model->modelId());
+  model.reset();
+  // translateMultipleRaw() drains the aggregate queue before returning, so
+  // there is nothing to clear there; the packing caches, however, belong to
+  // this very thread and would otherwise wait for a GEMM that may never come.
+  batchingPool_.clear();
+  marian::cpu::integer::releaseThreadPackingCaches();
+  purgeAllocator();
+  const bool destroyed = observer.expired();
+  if (lifecycle::enabled()) lifecycle::event("service_release_done destroyed=%d", destroyed ? 1 : 0);
+  return destroyed;
 }
 
 std::vector<Response> BlockingService::pivotMultiple(std::shared_ptr<TranslationModel> first,
@@ -136,29 +179,74 @@ AsyncService::AsyncService(const AsyncService::Config &config)
       cache_(makeOptionalCache(config_.cacheSize, /*mutexBuckets=*/config_.numWorkers)),
       logger_(config.logger) {
   ABORT_IF(config_.numWorkers == 0, "Number of workers should be at least 1 in a threaded workflow");
+  if (lifecycle::enabled()) lifecycle::event("service_ctor workers=%zu", config_.numWorkers);
   workers_.reserve(config_.numWorkers);
+  safeBatchingPool_.setConsumerCount(config_.numWorkers);
   for (size_t cpuId = 0; cpuId < config_.numWorkers; cpuId++) {
     workers_.emplace_back([cpuId, this] {
       // Consumer thread main-loop. Note that this is an infinite-loop unless the monitor is explicitly told to
       // shutdown, which happens in the destructor for this class.
       Batch batch;
       Ptr<TranslationModel> translationModel{nullptr};
-      while (safeBatchingPool_.generateBatch(translationModel, batch)) {
+      size_t seenMaintenanceEpoch = 0;
+      for (;;) {
+        bool maintenanceDue = false;
+        size_t sentences = safeBatchingPool_.generateBatch(seenMaintenanceEpoch, maintenanceDue, translationModel,
+                                                           batch);
+        if (maintenanceDue) {
+          // D0: everything this thread holds on a model's behalf goes here.
+          batch.clear();
+          translationModel.reset();
+          marian::cpu::integer::releaseThreadPackingCaches();
+          purgeAllocator();
+          if (lifecycle::enabled()) lifecycle::event("worker_maintenance cpu=%zu", cpuId);
+          safeBatchingPool_.ackMaintenance();
+          continue;
+        }
+        if (sentences == 0) break;  // shutdown
         translationModel->translateBatch(cpuId, batch);
+        // D0: drop the batch's RequestSentences and this worker's owning model
+        // reference before blocking again. Without this the last batch's model
+        // stays alive for as long as the worker sits idle -- which is forever,
+        // in an app that has stopped translating.
+        batch.clear();
+        translationModel.reset();
       }
+      if (lifecycle::enabled()) lifecycle::event("worker_shutdown cpu=%zu", cpuId);
     });
   }
 }
 
+bool AsyncService::release(std::shared_ptr<TranslationModel> &&model) {
+  std::weak_ptr<TranslationModel> observer = model;
+  if (lifecycle::enabled() && model) lifecycle::event("service_release id=%zu", model->modelId());
+  model.reset();
+  safeBatchingPool_.runMaintenance();
+  // The model itself was freed on whichever thread dropped the last reference
+  // -- possibly this one -- so purge here too, not only on the workers.
+  purgeAllocator();
+  const bool destroyed = observer.expired();
+  if (lifecycle::enabled()) lifecycle::event("service_release_done destroyed=%d", destroyed ? 1 : 0);
+  return destroyed;
+}
+
+void AsyncService::drain() { safeBatchingPool_.runMaintenance(); }
+
 void AsyncService::clear() { safeBatchingPool_.clear(); }
 
 AsyncService::~AsyncService() {
+  if (lifecycle::enabled()) lifecycle::event("service_dtor_enter workers=%zu", workers_.size());
   safeBatchingPool_.shutdown();
   for (std::thread &worker : workers_) {
     assert(worker.joinable());
     worker.join();
   }
   workers_.clear();
+  if (lifecycle::enabled()) {
+    lifecycle::event("service_dtor_done live_models=%ld live_graphs=%ld",
+                     lifecycle::liveModels().load(std::memory_order_relaxed),
+                     lifecycle::liveGraphs().load(std::memory_order_relaxed));
+  }
 }
 
 void AsyncService::pivot(std::shared_ptr<TranslationModel> first, std::shared_ptr<TranslationModel> second,

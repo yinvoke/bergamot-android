@@ -9,11 +9,16 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include "common/lifecycle.h"  // D0: prepacked-cache tracing
 #include "integer_common.h"
 #include "smmla_gemm.h"
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wcomment"
+#include "ruy/context.h"
+#include "ruy/context_get_ctx.h"
+#include "ruy/ctx.h"
 #include "ruy/platform.h"
+#include "ruy/prepacked_cache.h"
 #include "ruy/system_aligned_alloc.h"
 #pragma GCC diagnostic pop
 
@@ -26,6 +31,45 @@ namespace cpu {
 namespace integer {
 
 using Index = unsigned int;
+
+/// PATCH A / D0: everything the int8 ruy GEMM keeps per thread. A Context owns
+/// a thread pool, allocators and the prepacked-weight cache; rebuilding it per
+/// matmul is pure overhead, and Context is not thread-safe, so thread_local is
+/// the matching lifetime -- it maps 1:1 onto the AsyncService worker model.
+/// Hoisted into a named accessor (D0) so an explicit release can clear the
+/// cache from outside the GEMM. `inline` gives one instance per thread across
+/// all translation units.
+struct RuyThreadState {
+  ruy::Context context;
+  uint64_t seenGeneration = 0;
+  /// This thread's share of lifecycle::ruyPrepackedBytes(). Subtracted here so
+  /// the process-wide total drops when a worker thread exits.
+  long long accountedPrepackedBytes = 0;
+  ~RuyThreadState() {
+    if (accountedPrepackedBytes != 0)
+      lifecycle::ruyPrepackedBytes().fetch_sub(accountedPrepackedBytes, std::memory_order_relaxed);
+  }
+};
+
+inline RuyThreadState &threadRuyState() {
+  static thread_local RuyThreadState state;
+  return state;
+}
+
+/// D0: drop THIS thread's ruy prepacked-weight cache. Only affects the calling
+/// thread; the next GEMM re-packs, so this is a memory/latency trade only.
+inline void releaseThreadRuyCache() {
+  RuyThreadState &state = threadRuyState();
+  state.context.ClearPrepackedCache();
+  if (state.accountedPrepackedBytes != 0) {
+    lifecycle::event("ruy_prepack_released bytes=%lld", state.accountedPrepackedBytes);
+    lifecycle::ruyPrepackedBytes().fetch_sub(state.accountedPrepackedBytes, std::memory_order_relaxed);
+    state.accountedPrepackedBytes = 0;
+  }
+  // We just cleared, so adopt the current generation: no point clearing an
+  // empty cache again on the next GEMM.
+  state.seenGeneration = prepackGeneration().load(std::memory_order_relaxed);
+}
 
 #if RUY_PLATFORM_NEON
 
@@ -207,22 +251,28 @@ inline void transpose(const int8_t *input, Index rows, Index cols, int8_t *outpu
       // The following is adapted from
       // https://github.com/google/ruy/blob/878283640de7946a43053e8ebf4f15114fbc9156/example/example.cc#L129-L152
 
-      // PATCH A: one ruy::Context per thread instead of one per GEMM call.
-      // A Context owns a thread pool, allocators and the prepacked cache;
-      // rebuilding it on every matmul is pure overhead. Context is not
-      // thread-safe, so thread_local is the matching lifetime -- it maps 1:1
-      // onto the AsyncService worker model (same approach CTranslate2 takes).
-      static thread_local ruy::Context context;
+      // PATCH A / D0: the one ruy::Context per thread (see threadRuyState()).
+      RuyThreadState &state = threadRuyState();
+      ruy::Context &context = state.context;
+      long long &accountedPrepackedBytes = state.accountedPrepackedBytes;
 
       // PATCH B: drop this thread's prepacked weights when any model has been
       // torn down since we last packed. Cheap: one relaxed atomic load per
       // GEMM, and the clear only ever runs on the generation change.
-      static thread_local uint64_t seenGeneration = 0;
       const uint64_t generation =
           prepackGeneration().load(std::memory_order_relaxed);
-      if (generation != seenGeneration) {
+      if (generation != state.seenGeneration) {
         context.ClearPrepackedCache();
-        seenGeneration = generation;
+        if (lifecycle::enabled()) {
+          lifecycle::event("ruy_prepack_cleared bytes=%lld generation=%llu->%llu",
+                           accountedPrepackedBytes,
+                           static_cast<unsigned long long>(state.seenGeneration),
+                           static_cast<unsigned long long>(generation));
+          lifecycle::ruyPrepackedBytes().fetch_sub(accountedPrepackedBytes,
+                                                   std::memory_order_relaxed);
+          accountedPrepackedBytes = 0;
+        }
+        state.seenGeneration = generation;
       }
 
       // PATCH C: on CPUs with i8mm (Armv9 cores) the int8 GEMM runs the
@@ -266,6 +316,18 @@ inline void transpose(const int8_t *input, Index rows, Index cols, int8_t *outpu
       // When Dst is int32, mul_params is unused.
       ruy::MulParams<std::int32_t, std::int32_t> mul_params;
       ruy::Mul(lhs, rhs, mul_params, &context, &dst);
+
+      // D0: refresh this thread's share of the global prepacked-byte total.
+      // Only under the lifecycle gate -- it costs a cache read per GEMM.
+      if (lifecycle::enabled()) {
+        const long long bytes = static_cast<long long>(
+            ruy::get_ctx(&context)->GetPrepackedCache()->BuffersBytes());
+        if (bytes != accountedPrepackedBytes) {
+          lifecycle::ruyPrepackedBytes().fetch_add(bytes - accountedPrepackedBytes,
+                                                   std::memory_order_relaxed);
+          accountedPrepackedBytes = bytes;
+        }
+      }
 
       }  // PATCH C: end of the ruy path
 

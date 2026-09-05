@@ -3,6 +3,7 @@
 #include "batch.h"
 #include "byte_array_util.h"
 #include "cache.h"
+#include "common/lifecycle.h"  // D0: model/backend lifecycle tracing
 #include "common/logging.h"
 #include "data/corpus.h"
 #include "data/text_input.h"
@@ -53,16 +54,60 @@ TranslationModel::TranslationModel(const Config &options, MemoryBundle &&memory 
     // In this case, the loadpath does not load shortlist.
     shortlistGenerator_ = nullptr;
   }
+
+  lifecycle::liveModels().fetch_add(1, std::memory_order_relaxed);
+  if (lifecycle::enabled()) {
+    lifecycle::event("model_ctor id=%zu replicas=%zu model_bytes=%zu shortlist_bytes=%zu", modelId_, replicas,
+                     modelMemoryBytes(), memory_.shortlist.size());
+  }
 }
 
 // PATCH B: see translation_model.h. Bumping here makes every worker thread drop
 // its ruy prepacked-weight cache before any replacement model can be handed the
 // freed weight addresses.
-TranslationModel::~TranslationModel() { marian::cpu::integer::bumpPrepackGeneration(); }
+TranslationModel::~TranslationModel() {
+  if (lifecycle::enabled()) {
+    size_t loaded = 0;
+    for (const auto &backend : backend_) loaded += backend.initialized ? 1 : 0;
+    // model_bytes>0 here means some replica was never used, so loadBackend()
+    // never got to drop the file image (D0, lazy-replica residue).
+    lifecycle::event("model_dtor_enter id=%zu replicas=%zu backends_loaded=%zu model_bytes=%zu", modelId_,
+                     backend_.size(), loaded, modelMemoryBytes());
+  }
+  marian::cpu::integer::bumpPrepackGeneration();
+  // Release graphs + scorers here rather than leaving it to member destruction,
+  // so the counters logged below already reflect the freed ExpressionGraphs.
+  // Safe: scorers hold their own shared_ptr to shortlistGenerator_, and the
+  // graph stopped referencing memory_.models once loadBackend ran forward().
+  // memory_ is deliberately NOT cleared -- BinaryShortlistGenerator keeps a raw
+  // pointer into memory_.shortlist, and member destruction order already frees
+  // the generator first.
+  backend_.clear();
+  lifecycle::liveModels().fetch_sub(1, std::memory_order_relaxed);
+  if (lifecycle::enabled()) {
+    lifecycle::event("model_dtor_done id=%zu live_models=%ld live_graphs=%ld", modelId_,
+                     lifecycle::liveModels().load(std::memory_order_relaxed),
+                     lifecycle::liveGraphs().load(std::memory_order_relaxed));
+  }
+}
+
+size_t TranslationModel::modelMemoryBytes() const {
+  // The file image lives behind modelMemory_ (patch 0016), not memory_.models,
+  // and stays pinned until every replica has loaded -- so a non-zero value in
+  // the destructor means some replica was never used.
+  size_t bytes = 0;
+  if (auto memory = std::atomic_load(&modelMemory_)) {
+    for (const auto &model : *memory) bytes += model.size();
+  }
+  return bytes;
+}
 
 void TranslationModel::loadBackend(size_t idx) {
   auto &graph = backend_[idx].graph;
   auto &scorerEnsemble = backend_[idx].scorerEnsemble;
+  if (lifecycle::enabled()) {
+    lifecycle::event("load_backend_begin id=%zu replica=%zu model_bytes=%zu", modelId_, idx, modelMemoryBytes());
+  }
 
   marian::DeviceId device_(idx, DeviceType::cpu);
   graph = New<ExpressionGraph>(/*inference=*/true);  // set the graph to be inference only
@@ -130,7 +175,16 @@ void TranslationModel::loadBackend(size_t idx) {
   // them freed memory). Replicas that loaded concurrently keep their own pin
   // until they leave this function.
   if (backendsLoaded_.fetch_add(1) + 1 == backend_.size()) {
+    const size_t releasedBytes = modelMemoryBytes();
     std::atomic_store(&modelMemory_, std::shared_ptr<std::vector<AlignedMemory>>());
+    if (lifecycle::enabled()) {
+      // The local pin above still holds the bytes until this function returns.
+      lifecycle::event("model_memory_released id=%zu replica=%zu bytes=%zu", modelId_, idx, releasedBytes);
+    }
+  }
+  if (lifecycle::enabled()) {
+    lifecycle::event("load_backend_end id=%zu replica=%zu live_graphs=%ld", modelId_, idx,
+                     lifecycle::liveGraphs().load(std::memory_order_relaxed));
   }
 }
 
