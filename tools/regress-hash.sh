@@ -19,12 +19,17 @@ platform=${PLATFORM:-host}
 # default. The hash covers the whole corpus and batch composition changes the
 # output of individual sentences, so each corpus size has its own table entry
 # (bench set grew from FLORES lines 1-150 to 1-200 on 2026-09-04).
+# Host table re-baselined 2026-09-05 for patch 0018: the small-GEMM kernel
+# reproduces ruy's accumulation order, which differs from Accelerate's, so the
+# Accelerate host build moves (host/150 pivot happens not to); every device runs
+# ruy and is unchanged. Pre-0018 host values: host/150 1728c7c863926c5c/
+# 58b6667dd43d6364, host/200 3b458f7f7fe6fd68/00602a479d7c106b.
 n=$(wc -l < "$eng" | tr -d ' ')
 case "$platform/$n" in
-  host/150)   can_enzh=1728c7c863926c5c; can_pivot=58b6667dd43d6364 ;;
-  host/200)   can_enzh=3b458f7f7fe6fd68; can_pivot=00602a479d7c106b ;;
+  host/150)   can_enzh=0a46cfb6e339ff29; can_pivot=58b6667dd43d6364 ;;
+  host/200)   can_enzh=cec5ff3b1fc29f8e; can_pivot=e9d84f82b99250ee ;;
   device/150) can_enzh=1742b57a069b1da7; can_pivot=28028fc1ed7d0099 ;;
-  device/200) can_enzh=f8a315e6571cc957; can_pivot=fb3dda796b1186af ;;   # Mi 10 (865, ruy path) 2026-09-04
+  device/200) can_enzh=f8a315e6571cc957; can_pivot=fb3dda796b1186af ;;   # Mi 10 (865, ruy path) 2026-09-04; Mi 14 SMMLA == ruy 2026-09-05
   host/*|device/*) can_enzh=; can_pivot= ;;
   *) echo "unknown PLATFORM=$platform"; exit 2 ;;
 esac
