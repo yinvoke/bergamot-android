@@ -131,9 +131,25 @@ Java_io_github_yinvoker_bergamot_NativeBridge_loadModel(JNIEnv *env, jobject, jl
   }
 }
 
-JNIEXPORT void JNICALL
-Java_io_github_yinvoker_bergamot_NativeBridge_destroyModel(JNIEnv *, jobject, jlong model) {
-  delete reinterpret_cast<ModelHandle *>(model);
+// D0: releasing a model needs the service. Dropping the handle alone frees
+// nothing: each worker keeps an owning reference to the model it last
+// translated with, the aggregate queue keeps one too, and the per-thread GEMM
+// weight-packing caches only clear at the next GEMM on that thread -- which
+// never comes once the app stops translating. AsyncService::release() closes
+// all of that and reports whether the model was actually destroyed.
+JNIEXPORT jboolean JNICALL
+Java_io_github_yinvoker_bergamot_NativeBridge_releaseModel(JNIEnv *, jobject, jlong service, jlong model) {
+  auto *handle = reinterpret_cast<ModelHandle *>(model);
+  if (handle == nullptr) return JNI_TRUE;
+  bool destroyed = false;
+  if (service != 0) {
+    destroyed = reinterpret_cast<AsyncService *>(service)->release(std::move(*handle));
+  } else {
+    handle->reset();
+    destroyed = true;
+  }
+  delete handle;
+  return destroyed ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jobjectArray JNICALL

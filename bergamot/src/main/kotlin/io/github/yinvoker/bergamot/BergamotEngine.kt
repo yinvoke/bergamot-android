@@ -3,6 +3,7 @@ package io.github.yinvoker.bergamot
 import java.io.Closeable
 import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.withContext
 
@@ -115,18 +116,20 @@ class BergamotEngine(private val config: EngineConfig = EngineConfig()) : Closea
         }
     }
 
-    /** Release models regardless of idle deadline (hook for onTrimMemory). */
-    fun releaseAllModels() {
-        executor.execute {
-            models.values.forEach { NativeBridge.destroyModel(it.handle) }
-            models.clear()
-        }
-    }
+    /**
+     * Release models regardless of idle deadline (hook for onTrimMemory).
+     *
+     * The work runs on the engine thread. The returned future completes when
+     * the release has actually finished, and carries true when every model was
+     * really destroyed — false means something was still holding a reference.
+     * Callers that do not care may ignore it; a caller under memory pressure
+     * that wants to know the RAM is back should wait on it.
+     */
+    fun releaseAllModels(): Future<Boolean> = executor.submit<Boolean> { releaseAll() }
 
     override fun close() {
         executor.execute {
-            models.values.forEach { NativeBridge.destroyModel(it.handle) }
-            models.clear()
+            releaseAll()
             if (service != 0L) NativeBridge.destroyService(service)
             service = 0
         }
@@ -155,13 +158,23 @@ class BergamotEngine(private val config: EngineConfig = EngineConfig()) : Closea
         models[keyOf(model)]?.lastUsedAt = System.nanoTime()
     }
 
+    /** Returns true when every model was actually destroyed. */
+    private fun releaseAll(): Boolean {
+        var allDestroyed = true
+        models.values.forEach { allDestroyed = NativeBridge.releaseModel(service, it.handle) && allDestroyed }
+        models.clear()
+        return allDestroyed
+    }
+
     private fun unloadIdle() {
         val deadline = System.nanoTime() - config.idleUnloadMillis * 1_000_000
         val iterator = models.entries.iterator()
         while (iterator.hasNext()) {
             val entry = iterator.next()
             if (entry.value.lastUsedAt < deadline) {
-                NativeBridge.destroyModel(entry.value.handle)
+                // Safe here: this runs on the engine thread, never on an engine
+                // worker, and the batch that just finished is the last one.
+                NativeBridge.releaseModel(service, entry.value.handle)
                 iterator.remove()
             }
         }
