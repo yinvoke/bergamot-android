@@ -24,6 +24,8 @@
 #include <cassert>
 #include <cstdint>
 #include <cstddef>
+#include <string>
+#include <vector>
 
 namespace marian {
 namespace cpu {
@@ -54,6 +56,40 @@ void bumpPrepackGeneration();
 // Correctness-neutral: the next GEMM on this thread re-packs from the model's
 // own weights. Only affects the calling thread.
 void releaseThreadPackingCaches();
+
+// PATCH D1/D2: the embedding tables (Wemb) stay int8 in memory.
+//
+// Upstream dequantises every Wemb item at load time (binary.cpp ->
+// unquantizeWemb), which costs 4x the bytes of the stored table and then makes
+// the output layer quantise the very same numbers back to int8 on first use.
+// Both are avoidable: the stored bytes are already exactly what both consumers
+// want. These helpers gate the new path and carry the equivalence harness.
+//
+// BERGAMOT_FP32_WEMB=1  -> keep the old FP32-resident behaviour (kill switch,
+//                          same binary, for A/B and rollback).
+// BERGAMOT_WEMB_CHECK=1 -> additionally keep an FP32 shadow produced by the
+//                          reference unquantizeWemb() and compare every
+//                          dequantised embedding row against it, and run the
+//                          old requantisation pipeline over the whole table to
+//                          prove the output layer sees identical bytes.
+bool wembKeepFp32();
+bool wembCheckEnabled();
+
+// Only the real [vocab x dim] tables qualify. Note that the "*.alphas" models
+// also carry <name>_QuantMultA as a 1x1 *intgemm8* item whose dequantised value
+// IS the alpha; those must keep going through unquantizeWemb.
+bool isWembTableName(const std::string &name, size_t elements);
+
+// Equivalence harness (only populated when BERGAMOT_WEMB_CHECK=1).
+void registerWembShadow(const std::string &name, std::vector<float> &&table);
+const std::vector<float> *findWembShadow(const std::string &name);
+// Strips a graph namespace prefix ("F0::decoder_Wemb" -> "decoder_Wemb").
+std::string stripParamNamespace(const std::string &name);
+void reportWembRowCheck(const std::string &name, size_t rows, size_t elements, size_t mismatches);
+// Counts the work the two paths do differently (load-time dequantisation,
+// first-batch MaxAbsolute + requantisation). Reported at exit under the same
+// env flag; a no-op otherwise.
+void countWembOp(const char *what, size_t elements);
 
 // Making sure we have access to common functions for RUY and INTGEMM
 class fetchAlphaFromModelNodeOp : public UnaryNodeOp {

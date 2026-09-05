@@ -248,6 +248,7 @@ private:
 
   Expr cachedShortWt_;  // short-listed version, cached (cleared by clear())
   Expr cachedShortb_;   // these match the current value of shortlist_
+  Expr cachedFullWt_;   // PATCH D1: no-shortlist B built from the int8 Wemb table, per batch
   Expr cachedShortLemmaEt_;
   Ptr<FactoredVocab> factoredVocab_;
   
@@ -287,6 +288,7 @@ public:
     shortlist_ = nullptr;
     cachedShortWt_ = nullptr;
     cachedShortb_  = nullptr;
+    cachedFullWt_ = nullptr;
     cachedShortLemmaEt_ = nullptr;
   }
 

@@ -9,6 +9,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
 #include "common/lifecycle.h"  // D0: prepacked-cache tracing
 #include "integer_common.h"
 #include "smmla_gemm.h"
@@ -383,6 +386,8 @@ bool transpose_;
   NodeOps forwardOps() override {
     return { [=]() {
       quantMult_ = *child(1)->val()->data();
+      countWembOp(isB_ ? "prepare_b_quantize" : "prepare_a_quantize",
+                  (size_t)child(0)->val()->shape().elements());
       quantize(child(0)->val()->data(), /*input*/
                 val_->data<int8_t>(), /*output*/
                 *child(1)->val()->data(), /*Quant Mult*/
@@ -429,11 +434,11 @@ bool transpose_;
   }
 };
 
-struct SelectColumnsBRuyNodeOp : public UnaryNodeOp {
+struct SelectColumnsBRuyNodeOp : public NaryNodeOp {
 public:
   float quantMult_;
   SelectColumnsBRuyNodeOp(Expr input, const std::vector<uint_least32_t>  &indices)
-      : UnaryNodeOp(input, newShape(input, indices), input->value_type()),  indices_(indices) {
+      : NaryNodeOp({input}, newShape(input, indices), input->value_type()),  indices_(indices) {
 
     set_name(input->name());
     setMemoize(false); // Enabling memoization leads to a massive memory leak.
@@ -442,10 +447,27 @@ public:
     ABORT_IF(child(0) == nullptr, "B cannot be null");
   }
 
+  // PATCH D1: variant that selects straight out of an already-quantised model
+  // parameter (an int8 Wemb, reshaped to the [dim x vocab] column-major view
+  // ruy wants). There is no PrepareB node to take the multiplier from, so it
+  // arrives as an explicit second child.
+  SelectColumnsBRuyNodeOp(Expr input, Expr quantMult, const std::vector<uint_least32_t>  &indices)
+      : NaryNodeOp({input, quantMult}, newShape(input, indices), input->value_type()), indices_(indices) {
+
+    set_name(input->name());
+    setMemoize(false);
+    ABORT_IF(child(0) == nullptr, "B cannot be null");
+    ABORT_IF(child(1) == nullptr, "Quant mult of B cannot be null");
+    ABORT_IF(!isIntgemm(input->value_type()),
+             "SelectColumnsB with an explicit quant mult expects an already quantised B");
+  }
+
   NodeOps forwardOps() override {
     return { [=]() {
-      //We get the quantization multiplier from a PrepareB or directly from the input
-      if (child(0)->type() == "RuyPrepareB") {
+      //We get the quantization multiplier from a PrepareB, an explicit child, or directly from the input
+      if (children().size() == 2) {
+        quantMult_ = *child(1)->val()->data();
+      } else if (child(0)->type() == "RuyPrepareB") {
         auto bPreppedNode = std::static_pointer_cast<PrepareNode>(child(0));
         quantMult_ = bPreppedNode->quantMult_;
       } else {
@@ -508,6 +530,7 @@ struct QuantMultRuyNodeOp : public UnaryNodeOp {
         *val_->data() = *(reinterpret_cast<float *>(reinterpret_cast<int8_t *>(child(0)->val()->data()) + child(0)->val()->shape().elements()));
       } else {
         auto input = child(0)->val();
+        countWembOp(isB_ ? "max_absolute_b" : "max_absolute_a", (size_t)input->size());
         *val_->data() = 127.0f / MaxAbsolute(input->data(), input->data() + input->size());
       }
     }};
@@ -538,6 +561,187 @@ struct QuantMultRuyNodeOp : public UnaryNodeOp {
     return std::hash<std::string>{}(name());
   }
 
+};
+
+/*
+ * PATCH D1: B multiplier for an embedding table that stayed int8.
+ *
+ * The FP32 path derived it as 127 / MaxAbsolute(table) over the *dequantised*
+ * table, i.e. over int8[i] * (1/q). Because 1/q > 0, that maximum is exactly
+ * max|int8| * (1/q) in float32, so the value can be reproduced bit for bit from
+ * the quantised bytes alone -- no 4x-sized FP32 copy needed. Reproducing it
+ * (rather than using the stored q) matters: on jaen the two differ by 2 ulp,
+ * which would perturb every logit.
+ *
+ * Memoised like QuantMultRuyNodeOp's B case: one pass over the table per graph.
+ */
+struct WembQuantMultNodeOp : public UnaryNodeOp {
+  WembQuantMultNodeOp(Expr input) : UnaryNodeOp(input, Shape({1}), Type::float32) {
+    set_name(input->name() + "_QuantMultBWemb");
+    ABORT_IF(!isIntgemm(input->value_type()), "WembQuantMult expects a quantised table");
+  }
+
+  NodeOps forwardOps() override {
+    return {[=]() {
+      auto input = child(0)->val();
+      const int8_t *data = reinterpret_cast<const int8_t *>(input->data());
+      const size_t n = (size_t)input->shape().elements();
+      const float storedQuantMult = *(reinterpret_cast<const float *>(data + n));
+
+      int maxAbs = 0;
+      for(size_t i = 0; i < n; ++i) {
+        int v = data[i] < 0 ? -(int)data[i] : (int)data[i];
+        if(v > maxAbs)
+          maxAbs = v;
+      }
+      countWembOp("wemb_max_absolute_int8", n);
+      const float maxAbsolute = (float)maxAbs * (1 / storedQuantMult);
+      *val_->data() = 127.0f / maxAbsolute;
+
+      if(wembCheckEnabled())
+        selfCheck(name(), data, n, storedQuantMult, *val_->data());
+    }};
+  }
+
+  // Runs the pipeline this node replaces -- dequantise the whole table, take
+  // MaxAbsolute, requantise with the production NEON kernel -- and reports
+  // whether the bytes and the multiplier come out identical.
+  static void selfCheck(const std::string &name,
+                        const int8_t *data,
+                        size_t n,
+                        float storedQuantMult,
+                        float derivedQuantMult) {
+    std::vector<float> dequantized(n);
+    const float unquant = 1 / storedQuantMult;
+    int maxAbs = 0;
+    for(size_t i = 0; i < n; ++i) {
+      dequantized[i] = data[i] * unquant;
+      int v = data[i] < 0 ? -(int)data[i] : (int)data[i];
+      if(v > maxAbs)
+        maxAbs = v;
+    }
+    float maxAbsolute = MaxAbsolute(dequantized.data(), dequantized.data() + n);
+    float requantMult = 127.0f / maxAbsolute;
+    std::vector<int8_t> requantized(n);
+    quantize(dequantized.data(), requantized.data(), requantMult, 1, (Index)n);
+    size_t mismatches = 0;
+    for(size_t i = 0; i < n; ++i)
+      if(requantized[i] != data[i])
+        ++mismatches;
+    uint32_t storedBits, requantBits, derivedBits;
+    std::memcpy(&storedBits, &storedQuantMult, sizeof(storedBits));
+    std::memcpy(&requantBits, &requantMult, sizeof(requantBits));
+    std::memcpy(&derivedBits, &derivedQuantMult, sizeof(derivedBits));
+    // stderr, not LOG(): the bergamot configs run with quiet: true.
+    std::fprintf(stderr,
+                 "[wemb-check] %s elements=%zu max_abs_int8=%d "
+                 "stored_q=%.17g (0x%08x) fp32_path_q=%.17g (0x%08x) derived_q=%.17g (0x%08x) "
+                 "q_bits_equal=%d requant_mismatches=%zu\n",
+                 name.c_str(), n, maxAbs, (double)storedQuantMult, storedBits, (double)requantMult,
+                 requantBits, (double)derivedQuantMult, derivedBits,
+                 requantBits == derivedBits ? 1 : 0, mismatches);
+  }
+
+  NodeOps backwardOps() override {
+    ABORT("Only used for inference");
+    return {NodeOp(0)};
+  }
+
+  const std::string type() override { return "RuyQuantMultBWemb"; }
+
+  bool equal(Expr node) override {
+    if(hash() == node->hash())
+      return true;
+    return false;
+  }
+
+  size_t hash() override { return std::hash<std::string>{}(name()); }
+};
+
+/*
+ * PATCH D2: gather-and-dequantise for an int8 embedding table.
+ *
+ * Replaces rows(E, idx) when E stayed quantised. Dequantises only the rows the
+ * batch actually looks up, using the exact expression (and expression order)
+ * of cpu::integer::unquantizeWemb, so the result is bit-identical to gathering
+ * from the fully dequantised table.
+ */
+struct RowsDequantNodeOp : public NaryNodeOp {
+  RowsDequantNodeOp(Expr table, Expr indices)
+      : NaryNodeOp({table, indices}, newShape(table, indices), Type::float32) {
+    matchOrAbort<IndexType>(indices->value_type());
+    ABORT_IF(!isIntgemm(table->value_type()),
+             "RowsDequantNodeOp expects a quantised embedding table, got {}", table->value_type());
+    ABORT_IF(table->shape().size() != 2, "RowsDequantNodeOp expects a 2-dimensional table");
+    set_name(table->name());
+    setMemoize(false);
+  }
+
+  NodeOps forwardOps() override {
+    return {[=]() {
+      auto table = child(0)->val();
+      auto indices = child(1)->val();
+      const int8_t *src = reinterpret_cast<const int8_t *>(table->data());
+      const size_t width = (size_t)table->shape()[-1];
+      const size_t vocab = (size_t)table->shape()[0];
+      const float quantMult
+          = *(reinterpret_cast<const float *>(src + table->shape().elements()));
+      // Same expression, same order, as unquantizeWemb: one reciprocal, then
+      // one float32 multiply per element.
+      const float unquant = 1 / quantMult;
+      const IndexType *idx = indices->data<IndexType>();
+      const size_t rows = (size_t)indices->shape().elements();
+      float *dst = val_->data<float>();
+      for(size_t r = 0; r < rows; ++r) {
+        const size_t row = (size_t)idx[r];
+        ABORT_IF(row >= vocab, "Embedding index {} out of range (vocab {})", row, vocab);
+        const int8_t *in = src + row * width;
+        float *out = dst + r * width;
+        for(size_t c = 0; c < width; ++c)
+          out[c] = in[c] * unquant;
+      }
+      if(wembCheckEnabled())
+        check(name(), idx, rows, width, dst);
+    }};
+  }
+
+  // Compares against the FP32 table the reference unquantizeWemb() produced at
+  // load time (BERGAMOT_WEMB_CHECK=1 keeps one around).
+  static void check(const std::string &name,
+                    const IndexType *idx,
+                    size_t rows,
+                    size_t width,
+                    const float *out) {
+    const std::vector<float> *shadow = findWembShadow(stripParamNamespace(name));
+    if(!shadow)
+      return;
+    size_t mismatches = 0;
+    for(size_t r = 0; r < rows; ++r) {
+      const float *ref = shadow->data() + (size_t)idx[r] * width;
+      for(size_t c = 0; c < width; ++c) {
+        uint32_t a, b;
+        std::memcpy(&a, &out[r * width + c], sizeof(a));
+        std::memcpy(&b, &ref[c], sizeof(b));
+        if(a != b)
+          ++mismatches;
+      }
+    }
+    reportWembRowCheck(name, rows, rows * width, mismatches);
+  }
+
+  NodeOps backwardOps() override {
+    ABORT("Only used for inference");
+    return {NodeOp(0)};
+  }
+
+  const std::string type() override { return "RuyRowsDequant"; }
+
+private:
+  static Shape newShape(Expr table, Expr indices) {
+    Shape shape = table->shape();
+    shape.set(0, (int)indices->shape().elements());
+    return shape;
+  }
 };
 
 class AffineOrDotNodeOp : public NaryNodeOp {

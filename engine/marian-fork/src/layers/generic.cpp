@@ -1,5 +1,7 @@
 #include "marian.h"
 
+#include <numeric>
+
 #include "layers/generic.h"
 #include "layers/constructors.h"
 #include "layers/loss.h"
@@ -253,6 +255,18 @@ namespace marian {
           Wt_ = graph_->param(name + "_Wt", {numOutputClasses, inputDim}, inits::glorotUniform(false, true));
       }
 
+      // PATCH D1: an int8-resident tied embedding table can only be consumed by
+      // the ruy int8 output path. Factored vocabularies slice Wt_ and LSH reads
+      // it as floats; both need the dequantising loader.
+      if(isIntgemm(Wt_->value_type())) {
+        ABORT_IF(factoredVocab_,
+                 "An int8-resident output projection is not supported with a factored vocabulary. "
+                 "Set BERGAMOT_FP32_WEMB=1 to fall back to the dequantising loader.");
+        ABORT_IF(lsh_,
+                 "--output-approx-knn is not supported with an int8-resident output projection. "
+                 "Set BERGAMOT_FP32_WEMB=1 to fall back to the dequantising loader.");
+      }
+
       if(hasBias_)
         b_ = graph_->param(name + "_b", {1, numOutputClasses}, inits::zeros());
 
@@ -269,6 +283,19 @@ namespace marian {
         lemmaEt_ = graph_->param(name + "_lemmaEt", {lemmaDimEmb, lemmaVocabDim}, initFunc); // [L x U] L=lemmaDimEmb; transposed for speed
       }
     }
+
+#ifdef ARM
+    // PATCH D1: an int8 Wemb parameter is stored row-major as [vocab x dim],
+    // which is byte-for-byte the column-major [dim x vocab] B that ruy expects.
+    // Only the shape metadata disagrees, so a zero-copy reshape view is enough;
+    // the trailing quantMult stays where every consumer looks for it because the
+    // element count does not change.
+    static Expr preparedBView(Expr Wt) {
+      auto view = reshape(Wt, {Wt->shape()[-1], Wt->shape()[0]});
+      view->set_name(Wt->name());  // the alpha lookup keys off this
+      return view;
+    }
+#endif
 
     Logits Output::applyAsLogits(Expr input) /*override final*/ {
       lazyConstruct(input->shape()[-1]);
@@ -299,7 +326,13 @@ namespace marian {
         if ((graph_->getBackend()->isInt8() || matchType<intgemm8>(Wt_->value_type()) )&& graph_->getDeviceId().type == DeviceType::cpu) {
 #ifdef ARM
             if (matchType<intgemm8>(Wt_->value_type())) {
-              cachedShortWt_ = Expression<marian::cpu::integer::SelectColumnsBRuyNodeOp>(Wt_, shortlist_->indices());
+              // PATCH D1: the model's own int8 table already *is* the prepared B.
+              // The FP32 path dequantised it at load time and then quantised it
+              // straight back (proved byte-identical, see WembQuantMultNodeOp's
+              // self check); skip both and select columns out of the parameter.
+              Expr bQuantMult = Expression<marian::cpu::integer::WembQuantMultNodeOp>(Wt_);
+              cachedShortWt_ = Expression<marian::cpu::integer::SelectColumnsBRuyNodeOp>(
+                  preparedBView(Wt_), bQuantMult, shortlist_->indices());
             } else {
               Expr bQuantMult = Expression<marian::cpu::integer::QuantMultRuyNodeOp>(Wt_, true, Wt_->name());
               Expr bPrep = Expression<marian::cpu::integer::PrepareNode>(Wt_, bQuantMult, !isLegacyUntransposedW, true);
@@ -494,7 +527,29 @@ namespace marian {
       } else if (shortlist_) {
         return Logits(affineOrLSH(input, cachedShortWt_, cachedShortb_, false, /*transB=*/isLegacyUntransposedW ? false : true));
       } else {
+#ifdef ARM
+        // PATCH D1: without a shortlist the whole table is B. Route it through
+        // the same SelectColumnsB + WembQuantMult pair as the shortlisted path
+        // (selecting every column) so the multiplier is the exact value the
+        // FP32 path recomputed from the dequantised table -- the stored one is
+        // bit-equal for enzh but 2 ulp off for jaen. One full-table copy per
+        // batch, cached across decoder steps like cachedShortWt_; only
+        // no-shortlist configs pay it.
+        if (matchType<intgemm8>(Wt_->value_type())) {
+          if (!cachedFullWt_) {
+            const int dimVoc = Wt_->shape()[0];  // Wemb is stored [vocab x dim]
+            std::vector<WordIndex> all(dimVoc);
+            std::iota(all.begin(), all.end(), WordIndex(0));
+            Expr bQuantMult = Expression<marian::cpu::integer::WembQuantMultNodeOp>(Wt_);
+            cachedFullWt_ = Expression<marian::cpu::integer::SelectColumnsBRuyNodeOp>(
+                preparedBView(Wt_), bQuantMult, all);
+          }
+          return Logits(affineOrLSH(input, cachedFullWt_, b_, false, /*transB=*/true));
+        }
         return Logits(affineOrLSH(input, Wt_, b_, false, /*transB=*/isLegacyUntransposedW ? false : true));
+#else
+        return Logits(affineOrLSH(input, Wt_, b_, false, /*transB=*/isLegacyUntransposedW ? false : true));
+#endif
       }
     }
   }
@@ -525,6 +580,18 @@ namespace marian {
     }
 
     E_ = graph_->param(name, {dimVoc, dimEmb}, initFunc, fixed);
+
+    // PATCH D2: the quantised-table lookup only covers the plain path. Factored
+    // vocabularies go through csr_dot() and word2vec initialisation overwrites
+    // the table with floats; both need the FP32 layout.
+    if(isIntgemm(E_->value_type())) {
+      ABORT_IF(factoredVocab_,
+               "An int8-resident embedding table is not supported with a factored vocabulary. "
+               "Set BERGAMOT_FP32_WEMB=1 to fall back to the dequantising loader.");
+      ABORT_IF(options_->has("embFile") && !opt<std::string>("embFile").empty(),
+               "--embedding-vectors is not supported with an int8-resident embedding table. "
+               "Set BERGAMOT_FP32_WEMB=1 to fall back to the dequantising loader.");
+    }
   }
 
   // helper to embed a sequence of words (given as indices) via factored embeddings
@@ -610,7 +677,15 @@ namespace marian {
     ABORT_IF(factoredVocab_, "Embedding: applyIndices must not be used with a factored vocabulary");
     auto embIdxExpr = E_->graph()->indices(embIdx);
     embIdxExpr->set_name("data_" + std::to_string(/*batchIndex_=*/0));  // @TODO: how to know the batch index?
+#ifdef ARM
+    // PATCH D2: the table may have stayed int8 (see binary.cpp). Dequantise the
+    // gathered rows instead of the whole table at load time.
+    auto selectedEmbs = isIntgemm(E_->value_type())
+                            ? Expression<cpu::integer::RowsDequantNodeOp>(E_, embIdxExpr)
+                            : rows(E_, embIdxExpr);  // [(B*W) x E]
+#else
     auto selectedEmbs = rows(E_, embIdxExpr);     // [(B*W) x E]
+#endif
     selectedEmbs = reshape(selectedEmbs, shape);  // [W, B, E]
     // @BUGBUG: We should not broadcast along dimBatch=[-2]. Then we can also dropout before reshape() (test that separately)
     selectedEmbs = dropout(selectedEmbs, options_->get<float>("dropout", 0.0f), { selectedEmbs->shape()[-3], 1, 1 });

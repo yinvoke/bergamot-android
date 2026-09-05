@@ -1,0 +1,688 @@
+From a901c7e781bda5fff62cb842d13a3e58245d2da3 Mon Sep 17 00:00:00 2001
+From: yinvoker <yinvoker@outlook.com>
+Date: Sat, 5 Sep 2026 21:28:17 +0800
+Subject: [PATCH] =?UTF-8?q?perf:=20keep=20the=20Wemb=20tables=20int8=20?=
+ =?UTF-8?q?=E2=80=94=20dequantise=20rows=20on=20lookup,=20reuse=20the=20ta?=
+ =?UTF-8?q?ble=20as=20the=20output-layer=20B=20(patch=200022)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ engine/marian-fork/src/common/binary.cpp      |  30 +++
+ engine/marian-fork/src/layers/generic.cpp     |  77 ++++++-
+ engine/marian-fork/src/layers/generic.h       |   2 +
+ .../src/tensors/cpu/integer_common.cpp        | 134 +++++++++++
+ .../src/tensors/cpu/integer_common.h          |  36 +++
+ .../src/tensors/cpu/ruy_interface.h           | 212 +++++++++++++++++-
+ 6 files changed, 486 insertions(+), 5 deletions(-)
+
+diff --git a/engine/marian-fork/src/common/binary.cpp b/engine/marian-fork/src/common/binary.cpp
+index 02d105c..6cf2fe2 100644
+--- a/engine/marian-fork/src/common/binary.cpp
++++ b/engine/marian-fork/src/common/binary.cpp
+@@ -91,10 +91,40 @@ void loadItems(const void* current, std::vector<io::Item>& items, bool mapped) {
+     if(matchType<intgemm8>(items[i].type)) {
+       if(items[i].name.find("Wemb") != std::string::npos) {  // Since Wemb need to be dequantised,
+                                                              // we have a special case for them
++#ifdef ARM
++        // PATCH D1/D2: keep the embedding table quantised. The stored bytes are
++        // already the row-major [vocab x dim] int8 table both consumers want:
++        // the input side dequantises the handful of rows it actually gathers
++        // (RowsDequantNodeOp) and the output side feeds the very same buffer to
++        // ruy as a column-major B (SelectColumnsBRuyNodeOp). Copy verbatim,
++        // trailing quantMult included -- exactly what prepareAndTransposeB's ARM
++        // branch does for the other weights. BERGAMOT_FP32_WEMB=1 restores the
++        // dequantising path in the same binary.
++        if(cpu::integer::isWembTableName(items[i].name, items[i].shape.elements())
++           && !cpu::integer::wembKeepFp32()) {
++          resize(headers[i].dataLength);
++          std::copy(ptr, ptr + headers[i].dataLength, items[i].bytes->begin());
++          if(cpu::integer::wembCheckEnabled()) {
++            // Reference FP32 table, produced by the very function this branch
++            // replaces, for the per-lookup comparison in RowsDequantNodeOp.
++            io::Item shadow;
++            shadow.name = items[i].name;
++            shadow.shape = items[i].shape;
++            shadow.type = Type::float32;
++            shadow.bytes->resize(items[i].shape.elements() * sizeof(float));
++            cpu::integer::unquantizeWemb<Type::int8>(shadow, ptr);
++            const float* begin = reinterpret_cast<const float*>(shadow.bytes->data());
++            cpu::integer::registerWembShadow(
++                items[i].name, std::vector<float>(begin, begin + items[i].shape.elements()));
++          }
++          continue;
++        }
++#endif  // ARM
+         items[i].type = Type::float32;
+         resize(items[i].shape.elements()
+                * sizeof(float));  // We should have an extra float at the back but that requires a
+                                   // different format, due to allocator work
++        cpu::integer::countWembOp("load_dequantize_wemb", items[i].shape.elements());
+         cpu::integer::unquantizeWemb<Type::int8>(items[i], ptr);
+       } else {
+         resize(headers[i].dataLength);
+diff --git a/engine/marian-fork/src/layers/generic.cpp b/engine/marian-fork/src/layers/generic.cpp
+index 0c22967..086c1e2 100755
+--- a/engine/marian-fork/src/layers/generic.cpp
++++ b/engine/marian-fork/src/layers/generic.cpp
+@@ -1,5 +1,7 @@
+ #include "marian.h"
+ 
++#include <numeric>
++
+ #include "layers/generic.h"
+ #include "layers/constructors.h"
+ #include "layers/loss.h"
+@@ -253,6 +255,18 @@ namespace marian {
+           Wt_ = graph_->param(name + "_Wt", {numOutputClasses, inputDim}, inits::glorotUniform(false, true));
+       }
+ 
++      // PATCH D1: an int8-resident tied embedding table can only be consumed by
++      // the ruy int8 output path. Factored vocabularies slice Wt_ and LSH reads
++      // it as floats; both need the dequantising loader.
++      if(isIntgemm(Wt_->value_type())) {
++        ABORT_IF(factoredVocab_,
++                 "An int8-resident output projection is not supported with a factored vocabulary. "
++                 "Set BERGAMOT_FP32_WEMB=1 to fall back to the dequantising loader.");
++        ABORT_IF(lsh_,
++                 "--output-approx-knn is not supported with an int8-resident output projection. "
++                 "Set BERGAMOT_FP32_WEMB=1 to fall back to the dequantising loader.");
++      }
++
+       if(hasBias_)
+         b_ = graph_->param(name + "_b", {1, numOutputClasses}, inits::zeros());
+ 
+@@ -270,6 +284,19 @@ namespace marian {
+       }
+     }
+ 
++#ifdef ARM
++    // PATCH D1: an int8 Wemb parameter is stored row-major as [vocab x dim],
++    // which is byte-for-byte the column-major [dim x vocab] B that ruy expects.
++    // Only the shape metadata disagrees, so a zero-copy reshape view is enough;
++    // the trailing quantMult stays where every consumer looks for it because the
++    // element count does not change.
++    static Expr preparedBView(Expr Wt) {
++      auto view = reshape(Wt, {Wt->shape()[-1], Wt->shape()[0]});
++      view->set_name(Wt->name());  // the alpha lookup keys off this
++      return view;
++    }
++#endif
++
+     Logits Output::applyAsLogits(Expr input) /*override final*/ {
+       lazyConstruct(input->shape()[-1]);
+ 
+@@ -299,7 +326,13 @@ namespace marian {
+         if ((graph_->getBackend()->isInt8() || matchType<intgemm8>(Wt_->value_type()) )&& graph_->getDeviceId().type == DeviceType::cpu) {
+ #ifdef ARM
+             if (matchType<intgemm8>(Wt_->value_type())) {
+-              cachedShortWt_ = Expression<marian::cpu::integer::SelectColumnsBRuyNodeOp>(Wt_, shortlist_->indices());
++              // PATCH D1: the model's own int8 table already *is* the prepared B.
++              // The FP32 path dequantised it at load time and then quantised it
++              // straight back (proved byte-identical, see WembQuantMultNodeOp's
++              // self check); skip both and select columns out of the parameter.
++              Expr bQuantMult = Expression<marian::cpu::integer::WembQuantMultNodeOp>(Wt_);
++              cachedShortWt_ = Expression<marian::cpu::integer::SelectColumnsBRuyNodeOp>(
++                  preparedBView(Wt_), bQuantMult, shortlist_->indices());
+             } else {
+               Expr bQuantMult = Expression<marian::cpu::integer::QuantMultRuyNodeOp>(Wt_, true, Wt_->name());
+               Expr bPrep = Expression<marian::cpu::integer::PrepareNode>(Wt_, bQuantMult, !isLegacyUntransposedW, true);
+@@ -494,7 +527,29 @@ namespace marian {
+       } else if (shortlist_) {
+         return Logits(affineOrLSH(input, cachedShortWt_, cachedShortb_, false, /*transB=*/isLegacyUntransposedW ? false : true));
+       } else {
++#ifdef ARM
++        // PATCH D1: without a shortlist the whole table is B. Route it through
++        // the same SelectColumnsB + WembQuantMult pair as the shortlisted path
++        // (selecting every column) so the multiplier is the exact value the
++        // FP32 path recomputed from the dequantised table -- the stored one is
++        // bit-equal for enzh but 2 ulp off for jaen. One full-table copy per
++        // batch, cached across decoder steps like cachedShortWt_; only
++        // no-shortlist configs pay it.
++        if (matchType<intgemm8>(Wt_->value_type())) {
++          if (!cachedFullWt_) {
++            const int dimVoc = Wt_->shape()[0];  // Wemb is stored [vocab x dim]
++            std::vector<WordIndex> all(dimVoc);
++            std::iota(all.begin(), all.end(), WordIndex(0));
++            Expr bQuantMult = Expression<marian::cpu::integer::WembQuantMultNodeOp>(Wt_);
++            cachedFullWt_ = Expression<marian::cpu::integer::SelectColumnsBRuyNodeOp>(
++                preparedBView(Wt_), bQuantMult, all);
++          }
++          return Logits(affineOrLSH(input, cachedFullWt_, b_, false, /*transB=*/true));
++        }
++        return Logits(affineOrLSH(input, Wt_, b_, false, /*transB=*/isLegacyUntransposedW ? false : true));
++#else
+         return Logits(affineOrLSH(input, Wt_, b_, false, /*transB=*/isLegacyUntransposedW ? false : true));
++#endif
+       }
+     }
+   }
+@@ -525,6 +580,18 @@ namespace marian {
+     }
+ 
+     E_ = graph_->param(name, {dimVoc, dimEmb}, initFunc, fixed);
++
++    // PATCH D2: the quantised-table lookup only covers the plain path. Factored
++    // vocabularies go through csr_dot() and word2vec initialisation overwrites
++    // the table with floats; both need the FP32 layout.
++    if(isIntgemm(E_->value_type())) {
++      ABORT_IF(factoredVocab_,
++               "An int8-resident embedding table is not supported with a factored vocabulary. "
++               "Set BERGAMOT_FP32_WEMB=1 to fall back to the dequantising loader.");
++      ABORT_IF(options_->has("embFile") && !opt<std::string>("embFile").empty(),
++               "--embedding-vectors is not supported with an int8-resident embedding table. "
++               "Set BERGAMOT_FP32_WEMB=1 to fall back to the dequantising loader.");
++    }
+   }
+ 
+   // helper to embed a sequence of words (given as indices) via factored embeddings
+@@ -610,7 +677,15 @@ namespace marian {
+     ABORT_IF(factoredVocab_, "Embedding: applyIndices must not be used with a factored vocabulary");
+     auto embIdxExpr = E_->graph()->indices(embIdx);
+     embIdxExpr->set_name("data_" + std::to_string(/*batchIndex_=*/0));  // @TODO: how to know the batch index?
++#ifdef ARM
++    // PATCH D2: the table may have stayed int8 (see binary.cpp). Dequantise the
++    // gathered rows instead of the whole table at load time.
++    auto selectedEmbs = isIntgemm(E_->value_type())
++                            ? Expression<cpu::integer::RowsDequantNodeOp>(E_, embIdxExpr)
++                            : rows(E_, embIdxExpr);  // [(B*W) x E]
++#else
+     auto selectedEmbs = rows(E_, embIdxExpr);     // [(B*W) x E]
++#endif
+     selectedEmbs = reshape(selectedEmbs, shape);  // [W, B, E]
+     // @BUGBUG: We should not broadcast along dimBatch=[-2]. Then we can also dropout before reshape() (test that separately)
+     selectedEmbs = dropout(selectedEmbs, options_->get<float>("dropout", 0.0f), { selectedEmbs->shape()[-3], 1, 1 });
+diff --git a/engine/marian-fork/src/layers/generic.h b/engine/marian-fork/src/layers/generic.h
+index e836633..39c7e03 100755
+--- a/engine/marian-fork/src/layers/generic.h
++++ b/engine/marian-fork/src/layers/generic.h
+@@ -248,6 +248,7 @@ private:
+ 
+   Expr cachedShortWt_;  // short-listed version, cached (cleared by clear())
+   Expr cachedShortb_;   // these match the current value of shortlist_
++  Expr cachedFullWt_;   // PATCH D1: no-shortlist B built from the int8 Wemb table, per batch
+   Expr cachedShortLemmaEt_;
+   Ptr<FactoredVocab> factoredVocab_;
+   
+@@ -287,6 +288,7 @@ public:
+     shortlist_ = nullptr;
+     cachedShortWt_ = nullptr;
+     cachedShortb_  = nullptr;
++    cachedFullWt_ = nullptr;
+     cachedShortLemmaEt_ = nullptr;
+   }
+ 
+diff --git a/engine/marian-fork/src/tensors/cpu/integer_common.cpp b/engine/marian-fork/src/tensors/cpu/integer_common.cpp
+index 29e24ff..17053ff 100644
+--- a/engine/marian-fork/src/tensors/cpu/integer_common.cpp
++++ b/engine/marian-fork/src/tensors/cpu/integer_common.cpp
+@@ -8,6 +8,10 @@
+ #if defined(__aarch64__)
+ #include "smmla_gemm.h"
+ #endif
++#include <cstdio>
++#include <cstdlib>
++#include <map>
++#include <mutex>
+ 
+ #ifdef __SSE__
+ #include <emmintrin.h>
+@@ -45,6 +49,136 @@ void releaseThreadPackingCaches() {
+ #endif
+ }
+ 
++// PATCH D1/D2: see integer_common.h.
++namespace {
++bool envFlag(const char *name) {
++  const char *value = std::getenv(name);
++  return value != nullptr && value[0] != '\0' && value[0] != '0';
++}
++
++std::mutex &wembShadowMutex() {
++  static std::mutex mutex;
++  return mutex;
++}
++
++std::map<std::string, std::vector<float>> &wembShadows() {
++  static std::map<std::string, std::vector<float>> shadows;
++  return shadows;
++}
++}  // namespace
++
++bool wembKeepFp32() {
++  static const bool keep = envFlag("BERGAMOT_FP32_WEMB");
++  return keep;
++}
++
++bool wembCheckEnabled() {
++  static const bool check = envFlag("BERGAMOT_WEMB_CHECK");
++  return check;
++}
++
++bool isWembTableName(const std::string &name, size_t elements) {
++  if(name.find("Wemb") == std::string::npos)
++    return false;
++  // "<name>_QuantMultA" is a 1x1 intgemm8 item that only *looks* like a Wemb.
++  if(elements <= 1)
++    return false;
++  static const std::string suffix = "_QuantMultA";
++  if(name.size() >= suffix.size()
++     && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
++    return false;
++  return true;
++}
++
++void registerWembShadow(const std::string &name, std::vector<float> &&table) {
++  std::lock_guard<std::mutex> lock(wembShadowMutex());
++  wembShadows()[name] = std::move(table);
++}
++
++const std::vector<float> *findWembShadow(const std::string &name) {
++  std::lock_guard<std::mutex> lock(wembShadowMutex());
++  auto it = wembShadows().find(name);
++  return it == wembShadows().end() ? nullptr : &it->second;
++}
++
++std::string stripParamNamespace(const std::string &name) {
++  auto pos = name.rfind("::");
++  return pos == std::string::npos ? name : name.substr(pos + 2);
++}
++
++// Aggregated per table so a 150-sentence run does not emit one line per batch.
++// Printed straight to stderr: the bergamot configs run with quiet: true, which
++// silences the marian logger.
++namespace {
++struct RowCheckTally {
++  size_t rows = 0;
++  size_t elements = 0;
++  size_t mismatches = 0;
++};
++
++std::map<std::string, RowCheckTally> &rowCheckTallies() {
++  static std::map<std::string, RowCheckTally> tallies;
++  return tallies;
++}
++
++struct OpCounter {
++  size_t calls = 0;
++  size_t elements = 0;
++};
++
++std::map<std::string, OpCounter> &opCounters() {
++  static std::map<std::string, OpCounter> counters;
++  return counters;
++}
++
++struct RowCheckReporter {
++  ~RowCheckReporter() {
++    // No lock: this runs during static destruction, after translation stopped.
++    for(const auto &entry : rowCheckTallies())
++      std::fprintf(stderr,
++                   "[wemb-check] %s rows-dequant total: %zu rows / %zu elements, %zu mismatches\n",
++                   entry.first.c_str(), entry.second.rows, entry.second.elements,
++                   entry.second.mismatches);
++    for(const auto &entry : opCounters())
++      std::fprintf(stderr, "[wemb-count] %s calls=%zu elements=%zu\n", entry.first.c_str(),
++                   entry.second.calls, entry.second.elements);
++  }
++};
++
++// Constructed on first use by either reporter path; both make sure the mutex
++// and the maps above already exist, so this is destroyed before them.
++RowCheckReporter &reporter() {
++  static RowCheckReporter instance;
++  return instance;
++}
++}  // namespace
++
++void countWembOp(const char *what, size_t elements) {
++  if(!wembCheckEnabled())
++    return;
++  std::lock_guard<std::mutex> lock(wembShadowMutex());
++  auto &counters = opCounters();
++  rowCheckTallies();
++  reporter();
++  auto &counter = counters[what];
++  ++counter.calls;
++  counter.elements += elements;
++}
++
++void reportWembRowCheck(const std::string &name, size_t rows, size_t elements, size_t mismatches) {
++  std::lock_guard<std::mutex> lock(wembShadowMutex());
++  auto &tallies = rowCheckTallies();
++  opCounters();
++  reporter();  // flushes the totals at exit
++  auto &tally = tallies[name];
++  tally.rows += rows;
++  tally.elements += elements;
++  tally.mismatches += mismatches;
++  if(mismatches != 0)
++    std::fprintf(stderr, "[wemb-check] %s rows-dequant: %zu rows / %zu elements, %zu MISMATCHES\n",
++                 name.c_str(), rows, elements, mismatches);
++}
++
+ // This operates on floats after processing so doesn't care about int8_t vs int16_t.
+ void AddBias(marian::Tensor C, const marian::Tensor Bias) {
+   float* y = C->data();
+diff --git a/engine/marian-fork/src/tensors/cpu/integer_common.h b/engine/marian-fork/src/tensors/cpu/integer_common.h
+index c32c31e..c3921dd 100644
+--- a/engine/marian-fork/src/tensors/cpu/integer_common.h
++++ b/engine/marian-fork/src/tensors/cpu/integer_common.h
+@@ -24,6 +24,8 @@
+ #include <cassert>
+ #include <cstdint>
+ #include <cstddef>
++#include <string>
++#include <vector>
+ 
+ namespace marian {
+ namespace cpu {
+@@ -55,6 +57,40 @@ void bumpPrepackGeneration();
+ // own weights. Only affects the calling thread.
+ void releaseThreadPackingCaches();
+ 
++// PATCH D1/D2: the embedding tables (Wemb) stay int8 in memory.
++//
++// Upstream dequantises every Wemb item at load time (binary.cpp ->
++// unquantizeWemb), which costs 4x the bytes of the stored table and then makes
++// the output layer quantise the very same numbers back to int8 on first use.
++// Both are avoidable: the stored bytes are already exactly what both consumers
++// want. These helpers gate the new path and carry the equivalence harness.
++//
++// BERGAMOT_FP32_WEMB=1  -> keep the old FP32-resident behaviour (kill switch,
++//                          same binary, for A/B and rollback).
++// BERGAMOT_WEMB_CHECK=1 -> additionally keep an FP32 shadow produced by the
++//                          reference unquantizeWemb() and compare every
++//                          dequantised embedding row against it, and run the
++//                          old requantisation pipeline over the whole table to
++//                          prove the output layer sees identical bytes.
++bool wembKeepFp32();
++bool wembCheckEnabled();
++
++// Only the real [vocab x dim] tables qualify. Note that the "*.alphas" models
++// also carry <name>_QuantMultA as a 1x1 *intgemm8* item whose dequantised value
++// IS the alpha; those must keep going through unquantizeWemb.
++bool isWembTableName(const std::string &name, size_t elements);
++
++// Equivalence harness (only populated when BERGAMOT_WEMB_CHECK=1).
++void registerWembShadow(const std::string &name, std::vector<float> &&table);
++const std::vector<float> *findWembShadow(const std::string &name);
++// Strips a graph namespace prefix ("F0::decoder_Wemb" -> "decoder_Wemb").
++std::string stripParamNamespace(const std::string &name);
++void reportWembRowCheck(const std::string &name, size_t rows, size_t elements, size_t mismatches);
++// Counts the work the two paths do differently (load-time dequantisation,
++// first-batch MaxAbsolute + requantisation). Reported at exit under the same
++// env flag; a no-op otherwise.
++void countWembOp(const char *what, size_t elements);
++
+ // Making sure we have access to common functions for RUY and INTGEMM
+ class fetchAlphaFromModelNodeOp : public UnaryNodeOp {
+ public:
+diff --git a/engine/marian-fork/src/tensors/cpu/ruy_interface.h b/engine/marian-fork/src/tensors/cpu/ruy_interface.h
+index f9966f1..e13d492 100644
+--- a/engine/marian-fork/src/tensors/cpu/ruy_interface.h
++++ b/engine/marian-fork/src/tensors/cpu/ruy_interface.h
+@@ -9,6 +9,9 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdint>
++#include <cstring>
++#include <string>
++#include <vector>
+ #include "common/lifecycle.h"  // D0: prepacked-cache tracing
+ #include "integer_common.h"
+ #include "smmla_gemm.h"
+@@ -383,6 +386,8 @@ bool transpose_;
+   NodeOps forwardOps() override {
+     return { [=]() {
+       quantMult_ = *child(1)->val()->data();
++      countWembOp(isB_ ? "prepare_b_quantize" : "prepare_a_quantize",
++                  (size_t)child(0)->val()->shape().elements());
+       quantize(child(0)->val()->data(), /*input*/
+                 val_->data<int8_t>(), /*output*/
+                 *child(1)->val()->data(), /*Quant Mult*/
+@@ -429,11 +434,11 @@ bool transpose_;
+   }
+ };
+ 
+-struct SelectColumnsBRuyNodeOp : public UnaryNodeOp {
++struct SelectColumnsBRuyNodeOp : public NaryNodeOp {
+ public:
+   float quantMult_;
+   SelectColumnsBRuyNodeOp(Expr input, const std::vector<uint_least32_t>  &indices)
+-      : UnaryNodeOp(input, newShape(input, indices), input->value_type()),  indices_(indices) {
++      : NaryNodeOp({input}, newShape(input, indices), input->value_type()),  indices_(indices) {
+ 
+     set_name(input->name());
+     setMemoize(false); // Enabling memoization leads to a massive memory leak.
+@@ -442,10 +447,27 @@ public:
+     ABORT_IF(child(0) == nullptr, "B cannot be null");
+   }
+ 
++  // PATCH D1: variant that selects straight out of an already-quantised model
++  // parameter (an int8 Wemb, reshaped to the [dim x vocab] column-major view
++  // ruy wants). There is no PrepareB node to take the multiplier from, so it
++  // arrives as an explicit second child.
++  SelectColumnsBRuyNodeOp(Expr input, Expr quantMult, const std::vector<uint_least32_t>  &indices)
++      : NaryNodeOp({input, quantMult}, newShape(input, indices), input->value_type()), indices_(indices) {
++
++    set_name(input->name());
++    setMemoize(false);
++    ABORT_IF(child(0) == nullptr, "B cannot be null");
++    ABORT_IF(child(1) == nullptr, "Quant mult of B cannot be null");
++    ABORT_IF(!isIntgemm(input->value_type()),
++             "SelectColumnsB with an explicit quant mult expects an already quantised B");
++  }
++
+   NodeOps forwardOps() override {
+     return { [=]() {
+-      //We get the quantization multiplier from a PrepareB or directly from the input
+-      if (child(0)->type() == "RuyPrepareB") {
++      //We get the quantization multiplier from a PrepareB, an explicit child, or directly from the input
++      if (children().size() == 2) {
++        quantMult_ = *child(1)->val()->data();
++      } else if (child(0)->type() == "RuyPrepareB") {
+         auto bPreppedNode = std::static_pointer_cast<PrepareNode>(child(0));
+         quantMult_ = bPreppedNode->quantMult_;
+       } else {
+@@ -508,6 +530,7 @@ struct QuantMultRuyNodeOp : public UnaryNodeOp {
+         *val_->data() = *(reinterpret_cast<float *>(reinterpret_cast<int8_t *>(child(0)->val()->data()) + child(0)->val()->shape().elements()));
+       } else {
+         auto input = child(0)->val();
++        countWembOp(isB_ ? "max_absolute_b" : "max_absolute_a", (size_t)input->size());
+         *val_->data() = 127.0f / MaxAbsolute(input->data(), input->data() + input->size());
+       }
+     }};
+@@ -540,6 +563,187 @@ struct QuantMultRuyNodeOp : public UnaryNodeOp {
+ 
+ };
+ 
++/*
++ * PATCH D1: B multiplier for an embedding table that stayed int8.
++ *
++ * The FP32 path derived it as 127 / MaxAbsolute(table) over the *dequantised*
++ * table, i.e. over int8[i] * (1/q). Because 1/q > 0, that maximum is exactly
++ * max|int8| * (1/q) in float32, so the value can be reproduced bit for bit from
++ * the quantised bytes alone -- no 4x-sized FP32 copy needed. Reproducing it
++ * (rather than using the stored q) matters: on jaen the two differ by 2 ulp,
++ * which would perturb every logit.
++ *
++ * Memoised like QuantMultRuyNodeOp's B case: one pass over the table per graph.
++ */
++struct WembQuantMultNodeOp : public UnaryNodeOp {
++  WembQuantMultNodeOp(Expr input) : UnaryNodeOp(input, Shape({1}), Type::float32) {
++    set_name(input->name() + "_QuantMultBWemb");
++    ABORT_IF(!isIntgemm(input->value_type()), "WembQuantMult expects a quantised table");
++  }
++
++  NodeOps forwardOps() override {
++    return {[=]() {
++      auto input = child(0)->val();
++      const int8_t *data = reinterpret_cast<const int8_t *>(input->data());
++      const size_t n = (size_t)input->shape().elements();
++      const float storedQuantMult = *(reinterpret_cast<const float *>(data + n));
++
++      int maxAbs = 0;
++      for(size_t i = 0; i < n; ++i) {
++        int v = data[i] < 0 ? -(int)data[i] : (int)data[i];
++        if(v > maxAbs)
++          maxAbs = v;
++      }
++      countWembOp("wemb_max_absolute_int8", n);
++      const float maxAbsolute = (float)maxAbs * (1 / storedQuantMult);
++      *val_->data() = 127.0f / maxAbsolute;
++
++      if(wembCheckEnabled())
++        selfCheck(name(), data, n, storedQuantMult, *val_->data());
++    }};
++  }
++
++  // Runs the pipeline this node replaces -- dequantise the whole table, take
++  // MaxAbsolute, requantise with the production NEON kernel -- and reports
++  // whether the bytes and the multiplier come out identical.
++  static void selfCheck(const std::string &name,
++                        const int8_t *data,
++                        size_t n,
++                        float storedQuantMult,
++                        float derivedQuantMult) {
++    std::vector<float> dequantized(n);
++    const float unquant = 1 / storedQuantMult;
++    int maxAbs = 0;
++    for(size_t i = 0; i < n; ++i) {
++      dequantized[i] = data[i] * unquant;
++      int v = data[i] < 0 ? -(int)data[i] : (int)data[i];
++      if(v > maxAbs)
++        maxAbs = v;
++    }
++    float maxAbsolute = MaxAbsolute(dequantized.data(), dequantized.data() + n);
++    float requantMult = 127.0f / maxAbsolute;
++    std::vector<int8_t> requantized(n);
++    quantize(dequantized.data(), requantized.data(), requantMult, 1, (Index)n);
++    size_t mismatches = 0;
++    for(size_t i = 0; i < n; ++i)
++      if(requantized[i] != data[i])
++        ++mismatches;
++    uint32_t storedBits, requantBits, derivedBits;
++    std::memcpy(&storedBits, &storedQuantMult, sizeof(storedBits));
++    std::memcpy(&requantBits, &requantMult, sizeof(requantBits));
++    std::memcpy(&derivedBits, &derivedQuantMult, sizeof(derivedBits));
++    // stderr, not LOG(): the bergamot configs run with quiet: true.
++    std::fprintf(stderr,
++                 "[wemb-check] %s elements=%zu max_abs_int8=%d "
++                 "stored_q=%.17g (0x%08x) fp32_path_q=%.17g (0x%08x) derived_q=%.17g (0x%08x) "
++                 "q_bits_equal=%d requant_mismatches=%zu\n",
++                 name.c_str(), n, maxAbs, (double)storedQuantMult, storedBits, (double)requantMult,
++                 requantBits, (double)derivedQuantMult, derivedBits,
++                 requantBits == derivedBits ? 1 : 0, mismatches);
++  }
++
++  NodeOps backwardOps() override {
++    ABORT("Only used for inference");
++    return {NodeOp(0)};
++  }
++
++  const std::string type() override { return "RuyQuantMultBWemb"; }
++
++  bool equal(Expr node) override {
++    if(hash() == node->hash())
++      return true;
++    return false;
++  }
++
++  size_t hash() override { return std::hash<std::string>{}(name()); }
++};
++
++/*
++ * PATCH D2: gather-and-dequantise for an int8 embedding table.
++ *
++ * Replaces rows(E, idx) when E stayed quantised. Dequantises only the rows the
++ * batch actually looks up, using the exact expression (and expression order)
++ * of cpu::integer::unquantizeWemb, so the result is bit-identical to gathering
++ * from the fully dequantised table.
++ */
++struct RowsDequantNodeOp : public NaryNodeOp {
++  RowsDequantNodeOp(Expr table, Expr indices)
++      : NaryNodeOp({table, indices}, newShape(table, indices), Type::float32) {
++    matchOrAbort<IndexType>(indices->value_type());
++    ABORT_IF(!isIntgemm(table->value_type()),
++             "RowsDequantNodeOp expects a quantised embedding table, got {}", table->value_type());
++    ABORT_IF(table->shape().size() != 2, "RowsDequantNodeOp expects a 2-dimensional table");
++    set_name(table->name());
++    setMemoize(false);
++  }
++
++  NodeOps forwardOps() override {
++    return {[=]() {
++      auto table = child(0)->val();
++      auto indices = child(1)->val();
++      const int8_t *src = reinterpret_cast<const int8_t *>(table->data());
++      const size_t width = (size_t)table->shape()[-1];
++      const size_t vocab = (size_t)table->shape()[0];
++      const float quantMult
++          = *(reinterpret_cast<const float *>(src + table->shape().elements()));
++      // Same expression, same order, as unquantizeWemb: one reciprocal, then
++      // one float32 multiply per element.
++      const float unquant = 1 / quantMult;
++      const IndexType *idx = indices->data<IndexType>();
++      const size_t rows = (size_t)indices->shape().elements();
++      float *dst = val_->data<float>();
++      for(size_t r = 0; r < rows; ++r) {
++        const size_t row = (size_t)idx[r];
++        ABORT_IF(row >= vocab, "Embedding index {} out of range (vocab {})", row, vocab);
++        const int8_t *in = src + row * width;
++        float *out = dst + r * width;
++        for(size_t c = 0; c < width; ++c)
++          out[c] = in[c] * unquant;
++      }
++      if(wembCheckEnabled())
++        check(name(), idx, rows, width, dst);
++    }};
++  }
++
++  // Compares against the FP32 table the reference unquantizeWemb() produced at
++  // load time (BERGAMOT_WEMB_CHECK=1 keeps one around).
++  static void check(const std::string &name,
++                    const IndexType *idx,
++                    size_t rows,
++                    size_t width,
++                    const float *out) {
++    const std::vector<float> *shadow = findWembShadow(stripParamNamespace(name));
++    if(!shadow)
++      return;
++    size_t mismatches = 0;
++    for(size_t r = 0; r < rows; ++r) {
++      const float *ref = shadow->data() + (size_t)idx[r] * width;
++      for(size_t c = 0; c < width; ++c) {
++        uint32_t a, b;
++        std::memcpy(&a, &out[r * width + c], sizeof(a));
++        std::memcpy(&b, &ref[c], sizeof(b));
++        if(a != b)
++          ++mismatches;
++      }
++    }
++    reportWembRowCheck(name, rows, rows * width, mismatches);
++  }
++
++  NodeOps backwardOps() override {
++    ABORT("Only used for inference");
++    return {NodeOp(0)};
++  }
++
++  const std::string type() override { return "RuyRowsDequant"; }
++
++private:
++  static Shape newShape(Expr table, Expr indices) {
++    Shape shape = table->shape();
++    shape.set(0, (int)indices->shape().elements());
++    return shape;
++  }
++};
++
+ class AffineOrDotNodeOp : public NaryNodeOp {
+ 
+ public:
+-- 
+2.54.0
+

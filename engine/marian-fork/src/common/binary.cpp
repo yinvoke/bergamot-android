@@ -91,10 +91,40 @@ void loadItems(const void* current, std::vector<io::Item>& items, bool mapped) {
     if(matchType<intgemm8>(items[i].type)) {
       if(items[i].name.find("Wemb") != std::string::npos) {  // Since Wemb need to be dequantised,
                                                              // we have a special case for them
+#ifdef ARM
+        // PATCH D1/D2: keep the embedding table quantised. The stored bytes are
+        // already the row-major [vocab x dim] int8 table both consumers want:
+        // the input side dequantises the handful of rows it actually gathers
+        // (RowsDequantNodeOp) and the output side feeds the very same buffer to
+        // ruy as a column-major B (SelectColumnsBRuyNodeOp). Copy verbatim,
+        // trailing quantMult included -- exactly what prepareAndTransposeB's ARM
+        // branch does for the other weights. BERGAMOT_FP32_WEMB=1 restores the
+        // dequantising path in the same binary.
+        if(cpu::integer::isWembTableName(items[i].name, items[i].shape.elements())
+           && !cpu::integer::wembKeepFp32()) {
+          resize(headers[i].dataLength);
+          std::copy(ptr, ptr + headers[i].dataLength, items[i].bytes->begin());
+          if(cpu::integer::wembCheckEnabled()) {
+            // Reference FP32 table, produced by the very function this branch
+            // replaces, for the per-lookup comparison in RowsDequantNodeOp.
+            io::Item shadow;
+            shadow.name = items[i].name;
+            shadow.shape = items[i].shape;
+            shadow.type = Type::float32;
+            shadow.bytes->resize(items[i].shape.elements() * sizeof(float));
+            cpu::integer::unquantizeWemb<Type::int8>(shadow, ptr);
+            const float* begin = reinterpret_cast<const float*>(shadow.bytes->data());
+            cpu::integer::registerWembShadow(
+                items[i].name, std::vector<float>(begin, begin + items[i].shape.elements()));
+          }
+          continue;
+        }
+#endif  // ARM
         items[i].type = Type::float32;
         resize(items[i].shape.elements()
                * sizeof(float));  // We should have an extra float at the back but that requires a
                                   // different format, due to allocator work
+        cpu::integer::countWembOp("load_dequantize_wemb", items[i].shape.elements());
         cpu::integer::unquantizeWemb<Type::int8>(items[i], ptr);
       } else {
         resize(headers[i].dataLength);
