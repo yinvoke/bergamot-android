@@ -60,6 +60,7 @@ set(MARIAN_SOURCES
   
   tensors/cpu/integer_common.cpp
   tensors/cpu/smmla_gemm.cpp
+  tensors/cpu/small_sgemm_neon.cpp
   tensors/cpu/wasm_intgemm_fallback.cpp
 
   graph/expression_graph.cpp

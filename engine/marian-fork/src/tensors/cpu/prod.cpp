@@ -17,6 +17,7 @@
 
 #include "integer_common.h"
 #include "prod_blas.h"
+#include "tensors/cpu/small_sgemm_neon.h"
 
 
 namespace marian {
@@ -164,6 +165,34 @@ void ProdBatchedOld(marian::Tensor C,
     group_count,
     &group_size[0]);
 #else
+  // Attention fast path: the shapes ProdBatched sees are the two bdot() calls
+  // in transformer.h, and they are tiny (head dim 48; M == 1 while decoding).
+  // One ruy::Mul per batch item spends most of its time on ruy's per-call
+  // framework work and on padding M up to the 8x8 float kernel. The NEON
+  // kernels in small_sgemm_neon.cpp compute the same values bit for bit, so
+  // this is a pure speed switch; BERGAMOT_NO_SMALLGEMM=1 turns it off.
+  // Non-attention callers, transA, beta != 0 and irregular strides all fall
+  // through to the loop below unchanged. Prod() is untouched.
+  if(!transA && beta == 0.f && smallgemm::available()
+     && smallgemm::shapeIsSmall(transB, (int)m, (int)n, (int)k)) {
+    bool taken = true;
+    for(size_t i = 0; i < batchC && taken; ++i) {
+      taken = smallgemm::sgemmSmall(transB,
+                                    (int)m,
+                                    (int)n,
+                                    (int)k,
+                                    alpha,
+                                    A->data() + (i % batchA) * strideA,
+                                    (int)lda,
+                                    B->data() + (i % batchB) * strideB,
+                                    (int)ldb,
+                                    C->data() + i * strideC,
+                                    (int)ldc);
+    }
+    if(taken) return;
+    // sgemmSmall refused a layout mid-batch; it wrote only whole results, so
+    // redoing the whole batch with sgemm below is safe.
+  }
   for(size_t i = 0; i < batchC; ++i) {
     sgemm(transA,
           transB,
