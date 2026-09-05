@@ -13,6 +13,8 @@
 //   --bench         print "[bench] key=value" stats to stderr
 //   --cache-stats   query hit/miss counters; needs an ENABLE_CACHE_STATS build,
 //                   otherwise the engine ABORTs when a cache is enabled
+//   --mem           print "[mem] <stage> footprint_mb=... peak_rss_mb=..." for
+//                   baseline / after_load / steady / after_unload
 //   --dump-prefix P write each pass's output to P.passN.txt (determinism diffs)
 //   --lifecycle S   run release-lifecycle scenario S instead of a plain pass;
 //                   see kScenarioHelp below. Pair it with BERGAMOT_LIFECYCLE=1
@@ -37,7 +39,12 @@
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <mach/task.h>
 #include <mach/task_info.h>
+#include <malloc/malloc.h>
+#else
+#include <malloc.h>
 #endif
 
 #include "common/lifecycle.h"
@@ -72,6 +79,57 @@ double peakRssMb() {
 #else
   return static_cast<double>(usage.ru_maxrss) / 1024.0;  // kilobytes
 #endif
+}
+
+/// Live process memory, for the load / steady-state / after-unload ledger.
+/// macOS reports phys_footprint (what the kernel bills the process, the number
+/// Instruments and jetsam use); Linux reports VmRSS. Both also carry the
+/// high-water mark so a load-time spike is visible after the fact.
+struct FootprintSample {
+  double footprintMb = 0.0;  // phys_footprint (mac) / VmRSS (linux)
+  double peakMb = 0.0;       // peak resident, monotone over the process lifetime
+};
+
+/// Hand freed-but-still-dirty pages back to the OS before sampling. Without
+/// this, "steady" and "after unload" both read as the load-time high-water mark
+/// (the allocator keeps the pages) and the ledger says nothing.
+void releaseFreedPages() {
+#ifdef __APPLE__
+  malloc_zone_pressure_relief(nullptr, 0);
+#elif defined(__ANDROID__)
+  mallopt(M_PURGE, 0);
+#elif defined(__GLIBC__)
+  malloc_trim(0);
+#endif
+}
+
+FootprintSample footprintSample() {
+  releaseFreedPages();
+  FootprintSample sample;
+#ifdef __APPLE__
+  task_vm_info_data_t info;
+  mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+  if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) ==
+      KERN_SUCCESS) {
+    sample.footprintMb = static_cast<double>(info.phys_footprint) / 1e6;
+  }
+#else
+  std::ifstream status("/proc/self/status");
+  for (std::string line; std::getline(status, line);) {
+    if (line.rfind("VmRSS:", 0) == 0) {
+      sample.footprintMb = std::stod(line.substr(6)) / 1000.0;  // kB -> MB(1e6)
+    }
+  }
+#endif
+  struct rusage usage;
+  if (getrusage(RUSAGE_SELF, &usage) == 0) {
+#ifdef __APPLE__
+    sample.peakMb = static_cast<double>(usage.ru_maxrss) / 1e6;  // bytes
+#else
+    sample.peakMb = static_cast<double>(usage.ru_maxrss) / 1000.0;  // kB
+#endif
+  }
+  return sample;
 }
 
 double msSince(std::chrono::steady_clock::time_point start) {
@@ -439,6 +497,7 @@ int main(int argc, char *argv[]) {
   size_t repeat = 1;
   bool bench = false;
   bool cacheStatsWanted = false;
+  bool memWanted = false;
   const char *dumpPrefix = nullptr;
   const char *lifecycleScenario = nullptr;
   const char *releaseModeFlag = "release";
@@ -470,6 +529,8 @@ int main(int argc, char *argv[]) {
       bench = true;
     } else if (std::strcmp(argv[i], "--cache-stats") == 0) {
       cacheStatsWanted = true;
+    } else if (std::strcmp(argv[i], "--mem") == 0) {
+      memWanted = true;
     } else if (std::strcmp(argv[i], "--dump-prefix") == 0) {
       if (i + 1 >= argc) { std::cerr << "--dump-prefix needs a value\n"; exit(2); }
       dumpPrefix = argv[++i];
@@ -504,6 +565,15 @@ int main(int argc, char *argv[]) {
 
   auto emit = [&](const std::string &key, double value) {
     if (bench) std::cerr << "[bench] " << key << "=" << value << "\n";
+  };
+
+  // Memory ledger: one sample per stage, always printed (independent of --bench)
+  // so a memory run does not have to carry the timing noise with it.
+  auto emitMem = [&](const char *stage) {
+    if (!memWanted) return;
+    FootprintSample sample = footprintSample();
+    fprintf(stderr, "[mem] %s footprint_mb=%.1f peak_rss_mb=%.1f\n", stage, sample.footprintMb,
+            sample.peakMb);
   };
 
   if (bench) {
@@ -547,6 +617,7 @@ int main(int argc, char *argv[]) {
     BlockingService::Config config;
     config.cacheSize = cacheSize;
     BlockingService service{config};
+    emitMem("baseline");
 
     auto loadStart = std::chrono::steady_clock::now();
     auto makeModel = [&](const char *path) {
@@ -555,17 +626,23 @@ int main(int argc, char *argv[]) {
     auto model = makeModel(configs[0]);
     auto second = (configs.size() == 2) ? makeModel(configs[1]) : nullptr;
     emit("load_ms", msSince(loadStart));
+    emitMem("after_load");
 
     runPasses([&](std::vector<std::string> &&sources, const std::vector<ResponseOptions> &options) {
       return second ? service.pivotMultiple(model, second, std::move(sources), options)
                     : service.translateMultiple(model, std::move(sources), options);
     });
     if (cacheStatsWanted) cacheStats = service.cacheStats();
+    emitMem("steady");
+    model.reset();
+    second.reset();
+    emitMem("after_model_reset");
   } else {
     AsyncService::Config config;
     config.numWorkers = workers;
     config.cacheSize = cacheSize;
     AsyncService service{config};
+    emitMem("baseline");
 
     auto loadStart = std::chrono::steady_clock::now();
     auto makeModel = [&](const char *path) {
@@ -574,6 +651,7 @@ int main(int argc, char *argv[]) {
     auto model = makeModel(configs[0]);
     auto second = (configs.size() == 2) ? makeModel(configs[1]) : nullptr;
     emit("load_ms", msSince(loadStart));
+    emitMem("after_load");
 
     runPasses([&](std::vector<std::string> &&sources, const std::vector<ResponseOptions> &options) {
       return collectAll(std::move(sources), [&](size_t i, std::string &&text, auto callback) {
@@ -585,7 +663,17 @@ int main(int argc, char *argv[]) {
       });
     });
     if (cacheStatsWanted) cacheStats = service.cacheStats();
+    emitMem("steady");
+    model.reset();
+    second.reset();
+    emitMem("after_model_reset");
   }
+
+  // The service outlives the model handles above: its batching pool keeps a
+  // strong reference to every model it has ever seen
+  // (aggregate_batching_pool.h aggregateQueue_), so "after_model_reset" is not
+  // the real unload point -- this one is.
+  emitMem("after_service_destroyed");
 
   if (cacheStatsWanted) {
     emit("cache_hits", static_cast<double>(cacheStats.hits));
