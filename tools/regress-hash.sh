@@ -4,7 +4,7 @@
 # hash for this platform. Exact-integer GEMM means any kernel bug changes the
 # hash -- this is the correctness gate for the whole engine, no COMET needed.
 #   regress-hash.sh <smoke> <enzh-config.yml> <eng.txt> [<jaen-config.yml> <jpn.txt>]
-# Env: EXPECT_ENZH / EXPECT_PIVOT override the built-in table; PLATFORM=host|device
+# Env: EXPECT_ENZH / EXPECT_PIVOT override the built-in table; PLATFORM=host|host-ruy|device
 # Every canonical hash below assumes patch 0012 (requests ordered by id, not
 # heap address): without it batch composition follows allocator addresses --
 # ja->zh differs run to run on the host, and on Android even en->zh lands on a
@@ -30,7 +30,12 @@ case "$platform/$n" in
   host/200)   can_enzh=cec5ff3b1fc29f8e; can_pivot=e9d84f82b99250ee ;;
   device/150) can_enzh=1742b57a069b1da7; can_pivot=28028fc1ed7d0099 ;;
   device/200) can_enzh=f8a315e6571cc957; can_pivot=fb3dda796b1186af ;;   # Mi 10 (865, ruy path) 2026-09-04; Mi 14 SMMLA == ruy 2026-09-05
-  host/*|device/*) can_enzh=; can_pivot= ;;
+  # Host build with the float GEMM on ruy (-DUSE_APPLE_ACCELERATE=OFF -DUSE_RUY_SGEMM=ON):
+  # attention float products accumulate in ruy order, so the hashes differ from
+  # the Accelerate host table above. Baselined 2026-09-05 on the D0 tree.
+  host-ruy/150) can_enzh=54754317ebc21206; can_pivot=c9bbc00386d027f4 ;;
+  host-ruy/200) can_enzh=01802271f3d28be7; can_pivot=7dcaeab06551bf6d ;;
+  host/*|host-ruy/*|device/*) can_enzh=; can_pivot= ;;
   *) echo "unknown PLATFORM=$platform"; exit 2 ;;
 esac
 expect_enzh=${EXPECT_ENZH:-$can_enzh}; expect_pivot=${EXPECT_PIVOT:-$can_pivot}
