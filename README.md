@@ -18,21 +18,36 @@
 基于 [mozilla/translations](https://github.com/mozilla/translations) 中
 Firefox 内置整页翻译所使用的 [Bergamot](https://browser.mt/) 引擎,
 完成 Android 平台的 NDK 移植与 Kotlin 封装,并提供为 AAR。
+针对移动端 ARM 芯片优化了 i8mm / NEON 内核、权重缓存与模型内存管理。
+相比 v0.1.0,v0.2.0 在小米 10 英→中默认单 worker 实测中,
+**峰值内存降低约 44%,首次翻译耗时减少约 34%**([基准数据](docs/benchmarks/v0.2.0/README.md))。
 
 ## ✨ 特性
 
 - **离线推理**:全程无网络请求,模型来自 Mozilla 官方(MPL-2.0)
 - **质量**:COMET 领先 Google ML Kit 端侧翻译 13.5–17.5 分,真机实测见下
 - **Kotlin suspend API**:批量翻译、pivot 中转、HTML 感知翻译
-- **推理优化**:i8mm / NEON 内核加速,不支持 i8mm 的设备自动回退 ruy
+- **移动端适配**:i8mm / NEON 内核加速,不支持 i8mm 的设备自动回退 ruy
+- **性能优化**:相较 v0.1.0,峰值内存约 −44%、首次翻译耗时约 −34%(小米 10 英→中,默认单 worker)
 - **内存管理**:int8 embedding、模型按需加载与释放确认,可挂 `onTrimMemory`
 
 ## 📊 基准测试
 
+### v0.1.0 → v0.2.0
+
+小米 10 英→中默认单 worker:首次翻译 **7.21 → 4.74 秒(−34%)**,
+峰值 RSS **323 → 182 MiB(−44%)**。
+
+![v0.1.0 与 v0.2.0 的翻译耗时和峰值内存对比](docs/benchmarks/v0.2.0/comparison.png)
+
+同一设备、模型、200 句语料与默认参数,三轮独立进程取中位数。首次翻译含模型加载,
+内存为原生引擎 RSS。完整结果与复现方法见 [版本基准说明](docs/benchmarks/v0.2.0/README.md)。
+
+### 与 ML Kit 对比(历史基线)
+
 以下为 v0.1.0 阶段的两台真机对比(COMET × 100,越高越好)。
 v0.2.0 已优化计算与内存,旧图表及下文耗时、PSS 比例不代表新版表现。
-小米 12 的 200 句引擎测试中,4 worker 加载峰值 RSS 从 893 降至 401 MB;
-该口径与下方 app PSS 不同,完整对比待复测。
+下方 app PSS 与上方原生引擎 RSS 口径不同,新版与 ML Kit 的完整对比待复测。
 
 ![小米 14 基准](docs/benchmark-mi14.png)
 

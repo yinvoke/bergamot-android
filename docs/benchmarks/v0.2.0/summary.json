@@ -1,0 +1,38 @@
+{
+  "enzh_w1": {
+    "elapsed_ms": {
+      "before": 7207.989,
+      "after": 4735.772,
+      "reduction_pct": 34.29829041082054
+    },
+    "peak_rss_mib": {
+      "before": 322.969,
+      "after": 182.305,
+      "reduction_pct": 43.55340605445104
+    }
+  },
+  "enzh_w4": {
+    "elapsed_ms": {
+      "before": 3249.493,
+      "after": 2062.912,
+      "reduction_pct": 36.5158810928351
+    },
+    "peak_rss_mib": {
+      "before": 947.617,
+      "after": 485.074,
+      "reduction_pct": 48.811175823143735
+    }
+  },
+  "pivot_w1": {
+    "elapsed_ms": {
+      "before": 16076.976000000002,
+      "after": 10181.889,
+      "reduction_pct": 36.66788455739438
+    },
+    "peak_rss_mib": {
+      "before": 483.422,
+      "after": 287.43,
+      "reduction_pct": 40.54263148967156
+    }
+  }
+}
