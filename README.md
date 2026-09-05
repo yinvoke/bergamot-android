@@ -286,7 +286,7 @@ adb shell am start -n io.github.yinvoker.bergamot.bench/.MainActivity \
 - [ ] HTML 模式验证(`html = true` 已接通,待基准)
 - [x] GEMM 内核计算优化:ruy 上下文跨调用复用与常量权重预打包缓存;Armv8.6 i8mm **SMMLA int8 内核**,按 CPU 运行时门控,无 i8mm 机型自动回退 ruy,译文逐字节不变(8 Gen 3 单句 1.35×、8 Gen 1 blocking 1.26×;已验证设备见 [docs/smmla-compatibility.md](docs/smmla-compatibility.md))
 - [ ] SME2 指令集兼容:Armv9.2 SME2 外积内核(ZA 瓦片做 int8 外积),密度比 SMMLA 再高一档,批量预计约 1.4×;等有 SME2 的设备(天玑 9500 / Exynos 2600 起,高通 Oryon 无 SME)
-- [ ] 非 GEMM 计算部分优化
+- [x] 非 GEMM 计算部分优化:attention 的 float 小矩阵乘绕开 ruy 每次调用的固定开销,手写 NEON 小核复现 ruy 累加次序,译文逐字节不变(8 Gen 1 1.14×、8 Gen 3 1.10-1.14×、865 1.08×);ReLU/残差融合与 softmax 向量化实测各 1-2%,按 ROI 不落地
 - [ ] 参数调优
 - [ ] 内存优化
 - [ ] 多线程与调度优化
