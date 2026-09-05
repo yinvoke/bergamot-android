@@ -18,6 +18,8 @@ jobs:
       - uses: android-actions/setup-android@v3
       - name: Install NDK and CMake
         run: sdkmanager "ndk;29.0.13113456" "cmake;3.31.6"
+      - name: Check release notes
+        run: test -s ".github/releases/${GITHUB_REF_NAME}.md"
       - name: Test + build AAR
         run: ./gradlew :bergamot:test :bergamot:assembleRelease
       - name: Version the artifact
@@ -25,4 +27,5 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: bergamot-*.aar
-          generate_release_notes: true
+          body_path: .github/releases/${{ github.ref_name }}.md
+          fail_on_unmatched_files: true

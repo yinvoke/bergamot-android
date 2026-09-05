@@ -24,11 +24,15 @@ Firefox 内置整页翻译所使用的 [Bergamot](https://browser.mt/) 引擎,
 - **离线推理**:全程无网络请求,模型来自 Mozilla 官方(MPL-2.0)
 - **质量**:COMET 领先 Google ML Kit 端侧翻译 13.5–17.5 分,真机实测见下
 - **Kotlin suspend API**:批量翻译、pivot 中转、HTML 感知翻译
-- **内存管理**:模型按需加载、空闲自动卸载,可挂 `onTrimMemory`
+- **推理优化**:i8mm / NEON 内核加速,不支持 i8mm 的设备自动回退 ruy
+- **内存管理**:int8 embedding、模型按需加载与释放确认,可挂 `onTrimMemory`
 
 ## 📊 基准测试
 
-两台真机上的对比实测(COMET × 100,越高越好):
+以下为 v0.1.0 阶段的两台真机对比(COMET × 100,越高越好)。
+v0.2.0 已优化计算与内存,旧图表及下文耗时、PSS 比例不代表新版表现。
+小米 12 的 200 句引擎测试中,4 worker 加载峰值 RSS 从 893 降至 401 MB;
+该口径与下方 app PSS 不同,完整对比待复测。
 
 ![小米 14 基准](docs/benchmark-mi14.png)
 
@@ -207,7 +211,7 @@ registry.json  Mozilla 模型下载索引(每个方向的 URL / sha256 / 大小)
 
 ```kotlin
 dependencies {
-    implementation(files("libs/bergamot-v0.1.0.aar"))
+    implementation(files("libs/bergamot-v0.2.0.aar"))
     // 本地 AAR 不携带传递依赖,须自行声明:
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 }
@@ -247,16 +251,20 @@ val model = ModelFiles.fromDirectory(File(modelsDir, "enzh"))
 val translated: List<String> = engine.translate(texts, model)          // suspend
 // 日→中经英语中转,两个模型常驻:
 engine.translatePivot(texts, jaEn, enZh)
-engine.releaseAllModels()   // 例如挂在 onTrimMemory
+engine.releaseAllModels()   // 异步释放,可挂在 onTrimMemory;返回 Future<Boolean>
 ```
+
+`releaseAllModels()` 的 Future 完成后可确认释放结果;如需等待,请在后台线程调用
+`get()`,不要阻塞主线程。从 v0.1.0 升级需重新编译调用方。
 
 **每个进程只能创建一个 `BergamotEngine`**(底层 marian 运行时持有
 进程级全局状态)。
 
 ## 🔨 构建
 
-仅支持 ARM 主机(Apple Silicon / ARM Linux)。依赖:JDK 17、
-Android SDK、NDK r29、CMake 3.31.6。
+Android AAR 可通过 NDK 在 ARM 或 x86_64 主机交叉编译;主机 smoke CLI
+仅支持 ARM(Apple Silicon / ARM Linux)。依赖:JDK 17、Android SDK、
+NDK r29、CMake 3.31.6。
 
 ```bash
 ./gradlew :bergamot:assembleRelease          # AAR
@@ -275,21 +283,21 @@ adb shell am start -n io.github.yinvoker.bergamot.bench/.MainActivity \
 ## ⚠️ 范围与限制
 
 - 仅 arm64-v8a,minSdk 28,支持 16 KB page size。
-- int8 矩阵乘在支持 dotprod 的 CPU 上走 ruy 的 SDOT 内核(运行时分发;
-  cpuinfo 检测失败时回落到操作系统层检测)。
+- int8 矩阵乘按 CPU 能力选择 i8mm SMMLA 或 ruy(含 SDOT)内核。
+  已验证设备见 [兼容性清单](docs/smmla-compatibility.md)。
 
 ## 🗺️ Roadmap
 
-- [x] 基础引擎 + NDK 构建,并完成真机测试
-- [x] CI(构建与测试)
-- [x] 发布 AAR 构件
-- [ ] HTML 模式验证(`html = true` 已接通,待基准)
-- [x] GEMM 内核计算优化:ruy 上下文跨调用复用与常量权重预打包缓存;Armv8.6 i8mm **SMMLA int8 内核**,按 CPU 运行时门控,无 i8mm 机型自动回退 ruy,译文逐字节不变(8 Gen 3 单句 1.35×、8 Gen 1 blocking 1.26×;已验证设备见 [docs/smmla-compatibility.md](docs/smmla-compatibility.md))
-- [ ] SME2 指令集兼容:Armv9.2 SME2 外积内核(ZA 瓦片做 int8 外积),密度比 SMMLA 再高一档,批量预计约 1.4×;等有 SME2 的设备(天玑 9500 / Exynos 2600 起,高通 Oryon 无 SME)
-- [x] 非 GEMM 计算部分优化:attention 的 float 小矩阵乘绕开 ruy 每次调用的固定开销,手写 NEON 小核复现 ruy 累加次序,译文逐字节不变(8 Gen 1 1.14×、8 Gen 3 1.10-1.14×、865 1.08×);ReLU/残差融合与 softmax 向量化实测各 1-2%,按 ROI 不落地
-- [ ] 参数调优
-- [x] 内存优化:模型释放闭环——原来删句柄后 worker、聚合队列和每线程打包缓存仍持有模型,w4 驻留 728MB 直到服务销毁;现在 `releaseModel` 释放即回到进程底并返回确认(8 Gen 1/8 Gen 3/865 三台验证)。embedding 表常驻 int8、按行反量化,输出层直接复用同一张表,译文逐字节不变;每 worker 稳态省约 82MB、加载峰值省约 140MB(w4 加载峰值 893 → 401MB)
+- [x] 基础引擎与 NDK 移植
+- [x] CI 构建与测试
+- [x] AAR 发布
+- [x] GEMM 内核优化
+- [x] Attention 小矩阵计算优化
+- [x] 内存占用与模型释放优化
 - [ ] 多线程与调度优化
+- [ ] 参数与批处理调优
+- [ ] HTML 模式验证
+- [ ] SME2 指令集支持
 - [ ] 构建优化
 
 ## 📄 许可
