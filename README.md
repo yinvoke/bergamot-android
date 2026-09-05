@@ -288,7 +288,7 @@ adb shell am start -n io.github.yinvoker.bergamot.bench/.MainActivity \
 - [ ] SME2 指令集兼容:Armv9.2 SME2 外积内核(ZA 瓦片做 int8 外积),密度比 SMMLA 再高一档,批量预计约 1.4×;等有 SME2 的设备(天玑 9500 / Exynos 2600 起,高通 Oryon 无 SME)
 - [x] 非 GEMM 计算部分优化:attention 的 float 小矩阵乘绕开 ruy 每次调用的固定开销,手写 NEON 小核复现 ruy 累加次序,译文逐字节不变(8 Gen 1 1.14×、8 Gen 3 1.10-1.14×、865 1.08×);ReLU/残差融合与 softmax 向量化实测各 1-2%,按 ROI 不落地
 - [ ] 参数调优
-- [ ] 内存优化
+- [x] 内存优化:模型释放闭环——原来删句柄后 worker、聚合队列和每线程打包缓存仍持有模型,w4 驻留 728MB 直到服务销毁;现在 `releaseModel` 释放即回到进程底并返回确认(8 Gen 1/8 Gen 3/865 三台验证)。embedding 表常驻 int8、按行反量化,输出层直接复用同一张表,译文逐字节不变;每 worker 稳态省约 82MB、加载峰值省约 140MB(w4 加载峰值 893 → 401MB)
 - [ ] 多线程与调度优化
 - [ ] 构建优化
 
